@@ -1,0 +1,5 @@
+# Ignore everything by default. Explicitly force-add or unignore selected files.
+*
+!.gitignore
+!extensions/
+!extensions/**
