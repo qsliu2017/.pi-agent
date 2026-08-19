@@ -1,237 +1,228 @@
 # Subagent Extension
 
-Run configurable subagents as in-process Pi SDK sessions. Each subagent has an isolated conversation context while sharing a parent-managed lifecycle, live status, and bidirectional messaging channel.
+Run isolated subagents as in-process Pi SDK sessions. The extension keeps the parent focused while children research, implement, test, or recursively delegate work with independent context and configurable cost.
 
-## Features
+## User Stories
 
-- **Dynamic configuration**: The parent chooses the task, model, thinking level, system prompt, tools, working directory, context, and limits.
-- **In-process sessions**: Subagents use Pi SDK `AgentSession` objects; no child `pi` process is spawned.
-- **Persistent conversations**: Child sessions and extension metadata are saved so retained subagents can be recovered after Pi restarts.
-- **Background execution**: Multiple subagents can run while the parent continues working.
-- **Recursive delegation**: Subagents may create descendants within a harness-enforced depth limit.
-- **Live status**: Living subagents share one consolidated dashboard immediately above the editor.
-- **Resumable sessions**: Completed, paused, failed, or input-waiting subagents retain their JSONL conversation and are reopened lazily when resumed.
-- **Parent-mediated advice**: A child can yield with a structured message and continue after the parent replies.
-- **Lifecycle controls**: The parent can inspect, wait for, steer, or reversibly stop subagents.
+1. **Parallel research and review** — As the main agent, I want independent read-only workers to investigate a topic or review a large codebase from different perspectives, then combine concise findings without importing their working context.
+2. **Parallel implementation** — As the main agent, I want workers to implement separate submodules concurrently, ask for decisions when needed, and continue follow-up work from retained history.
+3. **Focused delegation for large tasks** — As the main agent, I want to own the overall plan while delegating details to cheaper models or lower thinking levels. A child may recursively decompose a subtask that is still too large for one focused context.
+4. **Bounded risky execution** — As the main agent, I want to delegate a test or command that may deadlock, wait long enough for legitimate work, and recover after a timeout instead of blocking an unattended parent session forever.
 
-## Harness Flags
+### Requirements
 
-- `--subagent-max-depth <integer>` sets the nonnegative recursion depth limit (default: `3`). A value of `0` disables subagent creation.
-- `--subagent-max-concurrency <integer>` sets the positive concurrent-run limit (default: `4`).
+- Run independent children concurrently.
+- Wait for delegated work by default so the parent does not finish early.
+- Allow explicit background work when the parent must react to one child while siblings continue.
+- Reuse a retained child's history for questions, corrections, and follow-up work.
+- Keep child transcripts out of the parent context; return only final handoffs, failures, and lifecycle notices.
+- Configure model, thinking level, role, tools, cwd, context, and timeout per child.
+- Support bounded recursive delegation with descendant-only management scope.
+- Abort potentially stuck runs with an enforceable timeout.
+- Default to read-only tools; use separate worktrees for concurrent writers.
+- Persist child sessions and lineage across Pi restarts.
+- Keep the model-facing protocol small: create, wait, list, and stop.
 
-These string CLI flags are parsed when the supervisor starts. They are harness policy and are not exposed in model-facing tool schemas.
+## Design
 
-## Public Tools
+A child is an immutable, one-run session node. Follow-up work creates a new child from an old child's retained history.
 
-### `subagent_create`
+A child ends with a concise final assistant response containing its results, artifacts, blockers, or questions. If input is needed, child instructions tell it to stop, ask a direct question, and wait for the parent to create a continuation with the answer.
 
-Creates a uniquely identified subagent and starts it in the background.
+A child is `running` while its model run is active and `stopped` afterward for any reason. The stopped snapshot carries its final response or error. The parent interprets the handoff and creates a continuation when it contains a question.
+
+### Tool Set
+
+#### `subagent_create`
 
 ```ts
-{
-  name?: string;
-  task: string;
-  model?: string;
-  thinking_level?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-  system_prompt?: string;
-  tools?: string[];
-  cwd?: string;
-  context?: string;
+subagent_create({
+  task: string,
+  from?: string, // retained child ID or unambiguous name
+  mode?: "wait" | "background", // default: "wait"
+  name?: string,
+  model?: string, // provider/model-id or unambiguous model ID
+  thinking_level?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max",
+  system_prompt?: string,
+  tools?: string[], // built-in tool allowlist
+  cwd?: string,
+  context?: string,
   limits?: {
-    timeout_seconds?: number;
-  };
-}
+    timeout_seconds?: number, // per-run execution limit
+  },
+})
 ```
 
-The extension returns a generated immutable ID, the effective name, and the initial state. Names are human-readable labels; subsequent tools accept either an ID or an unambiguous name.
+Without `from`, create a fresh child. With `from`, create a new child whose initial conversation is copied from the source child's active history, followed by `task`. The source stays immutable. Its model, thinking level, role, cwd, and tool policy are inherited unless safely overridden.
 
-The parent-provided system prompt is wrapped in fixed supervisor instructions. Tool access and limits are enforced by the child session configuration rather than by prompt instructions alone.
+- `mode: "wait"` waits for `stopped` and returns the complete final handoff or error. This is the default.
+- `mode: "background"` returns after durable acceptance. The final handoff or error is delivered later as a parent follow-up.
+- Cancelling a waiting call releases the wait but retains the child as background work.
+- A source must be `stopped`. Wait for or stop a running source before branching from it.
 
-The tool description is refreshed on parent session start and model selection. Omitting `model` inherits the current parent model, which the description identifies using its canonical `provider/model`. When scoped models are configured, the description includes a bounded list of preferred canonical choices; pinned thinking levels use `provider/model:level`.
-
-`system_prompt` defines the child’s role, behavior, and standing instructions. It is placed in the system-prompt layer and applies to every run in that child session. `context` contains task-specific facts or handoff material from the parent. It is included with the initial task as user-level context, does not override supervisor rules, and remains visible in the child conversation history.
-
-### `subagent_list`
-
-Returns concise snapshots of matching subagents.
+#### `subagent_wait`
 
 ```ts
-{
-  names?: string[];
-  states?: SubagentState[];
-  detail?: "compact" | "standard";
-}
+subagent_wait({
+  names?: string[], // child IDs or unambiguous names
+  for?: "any" | "all", // default: "all"
+  timeout_seconds?: number, // parent-wait limit; does not stop children
+})
 ```
 
-A standard snapshot may include:
+Wait for already-background work:
+
+- `for: "any"` returns when the first selected child becomes `stopped`.
+- `for: "all"` returns when every selected child becomes `stopped`.
+- Without `names`, selection is the caller-visible active children when the wait starts.
+- A wait timeout releases only the parent; selected children keep running.
+
+#### `subagent_list`
 
 ```ts
-{
-  id: string;
-  name: string;
-  state: SubagentState;
-  model: string;
-  thinking_level: string;
-  elapsed_ms: number;
-  idle_ms: number;
-  turns: number;
-  current_activity?: {
-    type: "thinking" | "tool";
-    name?: string;
-    preview?: string;
-    started_at?: number;
-  };
-  last_text_preview?: string;
-  pending_question?: string;
-  error?: string;
-  usage?: {
-    input: number;
-    output: number;
-    cache_read: number;
-    cache_write: number;
-    cost: number;
-  };
-}
+subagent_list({
+  names?: string[],
+  states?: Array<"running" | "stopped">,
+  detail?: "compact" | "standard", // default: "standard"
+})
 ```
 
-Snapshots are derived from child events. The extension does not run an additional model to summarize status.
+Return event-derived snapshots without invoking another model. Snapshots include identity, lineage, state, model, effort, timing, activity, turns, usage, final preview, and errors.
 
-### `subagent_send`
-
-Sends a message to a subagent. This is used to answer questions, steer active work, provide additional context, or continue an idle session.
+#### `subagent_stop`
 
 ```ts
-{
-  name: string;
-  message: string;
-  delivery?: "auto" | "steer" | "follow_up";
-}
+subagent_stop({
+  name: string, // child ID or unambiguous name
+  reason?: string,
+})
 ```
 
-`auto` applies state-aware behavior:
+Abort an active run, retain its durable history, and mark it `stopped`. The same child ID never runs again; create from it to continue the work.
 
-- `running`: deliver as a steering message.
-- `waiting_parent`, `paused`, `completed`, or `failed`: lazily reopen the persisted session and start a new run with the message while preserving prior context.
-- `stopping`: wait for the in-flight stop commit, then lazily reopen and continue. This wait is scoped to that child and does not block unrelated subagents.
-
-`steer` is delivered after the current child turn finishes its tool calls. `follow_up` is delivered after the current child run settles.
-
-### `subagent_wait`
-
-Waits without polling until a selected subagent reaches an interesting state.
+### Subagent States
 
 ```ts
-{
-  names?: string[];
-  events?: Array<"waiting_parent" | "completed" | "failed" | "paused">;
-  timeout_seconds?: number;
-}
+type SubagentState = "running" | "stopped"
 ```
 
-The tool streams compact status updates while waiting and returns when a requested event occurs or the timeout expires.
+- **`running`** — The child was durably accepted and its model run has not settled.
+- **`stopped`** — The child has no active run. Its snapshot carries the final response, error, timeout, or explicit stop reason.
 
-### `subagent_stop`
+Setup failure before durable acceptance returns a tool error and creates no child. Internal setup and cancellation phases are not exposed as additional public states. Wait and stop operations resolve only after the relevant child reaches `stopped`.
 
-Stops active work for one subagent.
+### Advanced Usage Patterns
 
-```ts
-{
-  name: string;
-  reason?: string;
-}
-```
+1. **Advisor loop** — Ask the child in `task` to stop and end with a direct question whenever it needs a decision. Answer with `subagent_create({ from: childId, task: answer })`, then repeat from the newest lineage node.
+2. **Parallel cohort** — Emit multiple default-wait creates in one assistant response for self-contained work; Pi runs them concurrently and returns the cohort together. For interactive work, create with `mode: "background"`, call `subagent_wait({ names, for: "any" })`, handle that child, and finish with `for: "all"`.
+3. **Alternative branches** — Create multiple children from the same retained source with different hypotheses, review feedback, or implementation strategies.
+4. **Hierarchical delegation** — Give a large child enough remaining depth to create scoped descendants. Each level receives direct-child handoffs and returns one concise response upward.
+5. **Potentially hanging test** — Use a default-wait create with a deliberately long `limits.timeout_seconds`. After timeout, inspect the stopped child's error and create a continuation from its retained history.
+6. **Cost-controlled delegation** — Use a cheaper model or lower thinking level for detailed child work while keeping planning and synthesis in the main session.
 
-Stopping is always reversible. It aborts the current run when necessary, transitions the child to `paused`, removes it from the live widget, persists its JSONL and leaf metadata, and disposes its in-memory SDK session. Repeated stop calls are idempotent. `subagent_send` can always reopen and resume a stopped child; there is no model-accessible permanent termination mode.
+### TUI
 
-## Child Tool
+The TUI has two surfaces: a live widget for active work and transcript cards for individual tool calls.
 
-### `subagent_yield`
-
-Each child receives a private structured tool for reporting completion or requesting parent input.
-
-```ts
-{
-  status: "completed" | "needs_input" | "blocked";
-  content: string;
-}
-```
-
-`content` contains the complete handoff: result, question, relevant attempts, paths, artifacts, or other information the parent needs. Calling the tool ends the current child run while retaining its session. `needs_input` and `blocked` map to the public `waiting_parent` state. The parent answers with `subagent_send`.
-
-A normal child response that finishes without calling `subagent_yield` is treated as `completed`.
-
-## States
-
-`SubagentState` includes `creating`, `running`, transient `stopping`, `waiting_parent`, `completed`, `failed`, and `paused`.
-
-```text
-creating
-   └─ running
-       ├─ stopping ──────── paused
-       ├─ waiting_parent ── subagent_send ── running
-       ├─ completed ─────── subagent_send ── running
-       ├─ failed ────────── subagent_send ── running
-       └─ paused ────────── subagent_send ── running
-
-any retained state ── subagent_stop ── paused
-```
-
-Only `creating`, `running`, and transient `stopping` require a resident SDK session. After a child reaches `waiting_parent`, `completed`, `failed`, or `paused`, the extension persists its state and leaf, disposes the SDK session, and retains compact metadata for lazy resumption.
-
-## Parent Notifications
-
-The extension injects a concise parent-visible message when a subagent:
-
-- requests input,
-- completes,
-- fails, or
-- is unexpectedly paused.
-
-Routine text and tool events remain in the TUI status display and are not copied into the parent model context.
-
-Injected subagent notifications remain extension-generated follow-up messages in the main agent's context and may trigger another turn. Their transcript renderer is invisible in Pi's default collapsed mode: it returns zero lines rather than printing notification text. Ctrl+O expansion reveals each notification as a width-safe card containing its complete state, identity, handoff, or reminder content. The messages remain display-enabled so expansion can reveal them; they are not hidden with `display: false`.
-
-Whenever the main agent settles while one or more descendants remain in `waiting_parent`, the extension appends a concise follow-up listing those children and triggers another main-agent turn. The reminder tells the main agent to answer/continue each child with `subagent_send` or reversibly remove it from the live set with `subagent_stop`. This repeats after settlement until no child remains in `waiting_parent`; stopping is safe because every stopped child remains resumable.
-
-## Recursive Delegation
-
-The extension maintains a parent/child tree and a configured maximum depth. Depth is harness metadata and is not exposed as a model-controlled argument.
-
-A root-created subagent receives an internal remaining-depth budget. A child with remaining depth may receive the subagent management tools; descendants receive a budget reduced by one. At zero remaining depth, `subagent_create` is omitted from that child’s active tools. Child management tools are scoped to the caller’s descendants, so a subagent cannot control its parent or siblings.
-
-The depth limit, concurrency limit, tool policy, and write policy are enforced by the extension. A descendant's built-in tools must be a subset of its parent's, and its canonical working directory must remain within its parent's working directory. Recursive children otherwise use the same lifecycle, persistence, status, notification, and advice protocol.
-
-## Status Display
-
-`subagent_create` and `subagent_send` leave static acknowledgements in the transcript. Their collapsed call cards show up to three lines of the delegated prompt; Ctrl+O expands them to the complete prompt. A create card includes its supplied parent context followed by the task, while a send card shows the complete message. Live child activity is rendered in one consolidated widget immediately above the user editor, rather than by repeatedly updating historical tool rows.
-
-The collapsed dashboard uses one fixed-height, single-line row per living subagent:
+#### Active Subagents Widget
 
 ```text
 Subagents
-● cache-review  opus:high  turn 8  $ cargo test cache::invalidation
-? migration     gpt-5.4    turn 3  waiting for parent
+● api-review  claude-sonnet low  turn 3  read src/server.ts
+● test-runner gpt-5.4 minimal   turn 1  $ bun test
 ```
 
-Living states are `creating`, `running`, `stopping`, and `waiting_parent`. Settled children leave the dashboard after their completion, failure, or pause notification is emitted; they remain available through `subagent_list` and can still be resumed when retained. Dashboard order follows creation and resumption order: creation appends a child, and resuming an idle child moves it to the newest position. Steering, tool activity, and other child events never reorder rows. The order is persisted across restarts. The dashboard bounds its height and reports any omitted count.
+- The widget shows only `running` children in creation order and disappears when none remain.
+- Collapsed mode uses one line per child: status, name, model and thinking level, turn count, and current activity.
+- Expanded mode shows the latest five turns with thinking, text, tool calls, results, errors, token usage, elapsed time, and idle time.
+- Its height is capped at 40% of the terminal, between 4 and 24 lines. When space is limited, the final line reports omitted lines or children.
+- Live events update only the widget and are throttled to avoid excessive redraws. Routine child streams never become parent chat messages.
 
-Ctrl+O follows Pi’s global tool-output expansion state. Expanded mode shows each living child’s latest five turns with available thinking, text, tool-input, and tool-result previews. The supervisor retains and persists only these five compact turn summaries per child for display; complete conversation history remains solely in JSONL. Collapsed rows and expanded detail lines are truncated to terminal width rather than wrapped so routine updates do not change widget height.
+#### Tool Call Cards
 
-Child `message_update`, `tool_execution_*`, `turn_end`, retry, compaction, and lifecycle events update in-memory status and invalidate only the bottom dashboard. Streaming invalidations are throttled. The dashboard does not run clock-only refreshes; elapsed and idle values advance when child events occur. This keeps status current without continuously rewriting transcript history.
+Each model-facing tool has a compact transcript card. Values in `{{braces}}` are dynamic; lines marked with `?` are omitted when absent. The final status line updates reactively while the call is active and, for background creates, after the tool call has returned.
 
-## Persistence
+**`subagent_create`**
 
-Each child uses a persistent `SessionManager.create(cwd, childSessionDir)` session file. The extension also persists the child ID, name, parent ID, session path, generated prompt configuration, tool policy, depth budget, limits, latest lifecycle state, and any queued recursive owner notifications.
+A typical background call looks like this:
 
-When the same parent session is restored, retained child metadata is recovered without keeping every child SDK session resident. Children that were `running` or `stopping` at shutdown are recovered as `paused`. `subagent_send` uses `SessionManager.open()` on demand, restores the persisted leaf ID, rebuilds the child context, and starts the next run. The SDK session is disposed again after the child next settles.
+```text
+subagent_create reviewer - background timeout 60s
+Review the API boundary and report compatibility risks.
+packages/api anthropic/claude-sonnet high
+7dc8… running
+```
 
-Child session files use a dedicated directory so they do not clutter normal interactive session selection. JSONL is retained for every child throughout the parent session's lifetime; stopping releases memory but does not delete conversation history.
+The header includes the optional name, continuation source, mode, and run timeout. The body previews at most three system-prompt lines and five task lines. The configuration row is intentionally differential: cwd, model, and thinking effort appear only when they differ from the parent, and a differing cwd is relative to the parent's cwd. If nothing differs, that row is absent. The UUID status row remains live after a background create returns, changing to `stopped` when the child settles. Expanding the card reveals unabridged instructions, context, and the final handoff or error.
 
-## Session and Safety Model
+**`subagent_wait`**
 
-- Child sessions use an explicit resource loader and do not inherit unrelated extensions, skills, or prompt templates. Recursive management tools are injected directly when the remaining-depth policy allows them.
-- Read-only tools are the recommended default.
-- Concurrent writers should use separate worktrees; lifecycle management does not prevent semantic file conflicts.
-- On parent shutdown or reload, active child runs are aborted, persistent state is flushed, and SDK session objects are disposed. Retained sessions can be recovered later.
-- Harness policies enforce recursion depth and concurrency. An optional `timeout_seconds` can abort a child that exceeds its cumulative active-time budget; no model-controlled turn limit is used.
-- Important child output is returned through structured yield results or explicit status inspection; continuous streams are not added to parent context.
+A wait card is a small cohort monitor rather than a numeric progress summary:
+
+```text
+subagent_wait all
+api-review done after 10s
+test-runner running
+docs-review done after 15s
+timeout 20s
+```
+
+Its header shows `any` or `all` for a cohort, but omits the strategy when exactly one child is selected. While waiting, each row says `running` or `done after Ns`, where the duration is measured from the start of this wait rather than from child creation. The final row shows the parent-wait timeout. The header changes when the wait settles:
+
+```text
+subagent_wait all done after 19s
+api-review done after 10s
+test-runner done after 19s
+docs-review done after 15s
+```
+
+A timed-out wait uses `timeout after Ns` in the header. Children still running at completion or timeout remain as bare names, making it clear that the wait ended without claiming they finished. The timeout footer is shown only while waiting. Expanding the card adds complete handoffs from children that stopped.
+
+**`subagent_list`**
+
+```text
+subagent_list {{states? | all}} - {{detail: compact | standard}}
+{{name}} {{uuid}} {{state}} turn {{turns}}
+{{name}} {{uuid}} {{state}} turn {{turns}}
+{{additional rows; overflow ends with an omitted count}}
+```
+
+Expanded compact cards show all matching rows. Expanded standard cards additionally show lineage, model, effort, timing, activity, usage, final response, and errors.
+
+**`subagent_stop`**
+
+```text
+subagent_stop {{name}}
+{{reason? at most 3 lines}}
+{{uuid}} {{running | stopped, reactive}}
+```
+
+Expanding the card reveals the complete stop reason and retained final handoff or error.
+
+Background completions appear as expandable **Subagent update** cards:
+
+```text
+Subagent update
+{{name}} {{uuid}} stopped
+{{final handoff or error; collapsed to a preview}}
+```
+
+When tool output is collapsed, the update keeps one handoff preview line; expanding it reveals the complete handoff or error.
+
+### Flags
+
+- `--subagent-max-depth <integer>` — Maximum recursive depth. Default: `3`; `0` disables creation.
+- `--subagent-max-concurrency <integer>` — Maximum concurrent child runs. Default: `4`.
+
+Limits are supervisor policy, not model-facing tool parameters. Concurrency admission is fail-fast, preventing recursive wait deadlocks behind active ancestors.
+
+### Session Model
+
+- Each child is an in-process Pi SDK `AgentSession`; no child `pi` process is spawned.
+- Each child uses a persistent `SessionManager` JSONL session. Registry metadata records identity, owner, lineage source, active leaf, configuration, state, timeout, usage, and compact UI status.
+- `from` clones the source's active conversation branch into a new session. It is a lineage edge, not an extra recursion edge; the new child belongs directly to the caller at the depth of a fresh child.
+- Child sessions use an explicit resource loader and do not inherit unrelated extensions, skills, or prompt templates. Recursive management tools are injected by the supervisor.
+- Descendants can only narrow built-in tool access, must remain inside the parent's canonical cwd, and cannot relax depth, concurrency, write, or timeout policy.
+- Routine child thinking, text, and tool streams update status UI only. Wait results and background notifications carry final handoffs into the direct owner's context.
+- Background completion notices and outstanding-work reminders are persisted and claimed by immutable child ID to avoid loss or duplication.
+- On shutdown or reload, active runs are aborted, durable state is flushed, and SDK sessions are disposed. Retained history can be used as the source of a new child after recovery.

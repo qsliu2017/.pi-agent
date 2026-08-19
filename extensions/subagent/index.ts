@@ -1,40 +1,48 @@
+import { relative, resolve } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import {
-	renderStaticSubagentCall,
-	renderStaticSubagentResult,
-	renderSubagentNotificationCard,
-	SubagentDashboard,
-} from "./render.ts";
-import {
-	SubagentCreateParams,
-	SubagentListParams,
-	SubagentSendParams,
-	SubagentStopParams,
-	SubagentWaitParams,
-} from "./schemas.ts";
+	CreateCardRegistry,
+	renderSubagentCreateCall,
+	renderSubagentCreateResult,
+	renderSubagentListCall,
+	renderSubagentListResult,
+	renderSubagentStopCall,
+	renderSubagentStopResult,
+	renderSubagentWaitCall,
+	renderSubagentWaitResult,
+} from "./cards.ts";
+import { renderSubagentNotificationCard, SubagentDashboard } from "./render.ts";
+import { SubagentCreateParams, SubagentListParams, SubagentStopParams, SubagentWaitParams } from "./schemas.ts";
 import { DEFAULT_SUBAGENT_MAX_CONCURRENCY, DEFAULT_SUBAGENT_MAX_DEPTH, SubagentSupervisor } from "./supervisor.ts";
 import {
+	type CreateSubagentDetails,
 	type ListSubagentsDetails,
 	NOTIFICATION_MESSAGE_TYPE,
 	ROOT_CALLER_ID,
 	type StopSubagentDetails,
-	type SubagentToolDetails,
+	type SubagentSnapshot,
 	type WaitSubagentsDetails,
 } from "./types.ts";
 
 const MAX_CREATE_DESCRIPTION_LENGTH = 2_000;
 const CREATE_DESCRIPTION_PREFIX =
-	"Create a persistent in-process SDK subagent and start it in the background. Returns immediately with its immutable id and initial state.";
+	"Create a fresh subagent or a continuation from stopped history. Waits by default; use mode background only for explicit detached work. For 2+ independent tasks, emit sibling subagent_create calls in one response.";
 
 type ModelDiscoveryContext = ExtensionContext & {
 	readonly scopedModels?: ReadonlyArray<{ model: Model<Api>; thinkingLevel?: ThinkingLevel }>;
 };
 
+type CreateCardState = { snapshot?: SubagentSnapshot };
+type WaitCardState = { details?: WaitSubagentsDetails };
+
 function canonicalModel(model: Model<Api>): string {
 	return `${model.provider}/${model.id}`;
+}
+
+function relativeCwd(baseCwd: string, childCwd: string): string {
+	return relative(resolve(baseCwd), resolve(baseCwd, childCwd)) || ".";
 }
 
 export function buildSubagentCreateDescription(
@@ -42,28 +50,20 @@ export function buildSubagentCreateDescription(
 	scopedModels: ReadonlyArray<{ model: Model<Api>; thinkingLevel?: ThinkingLevel }> = [],
 ): string {
 	const inheritance = model
-		? ` Omitting model inherits the current parent model (${canonicalModel(model)}).`
-		: " Omitting model inherits the current parent model.";
+		? ` Omitting model inherits the current parent or source model (${canonicalModel(model)}).`
+		: " Omitting model inherits the current parent or source model.";
 	const base = `${CREATE_DESCRIPTION_PREFIX}${inheritance}`;
-	if (scopedModels.length === 0) {
-		return base.length <= MAX_CREATE_DESCRIPTION_LENGTH
-			? base
-			: `${base.slice(0, MAX_CREATE_DESCRIPTION_LENGTH - 1)}…`;
-	}
-
-	const lead = `${base} Preferred available choices: `;
+	if (scopedModels.length === 0) return base.slice(0, MAX_CREATE_DESCRIPTION_LENGTH);
 	const choices = scopedModels.map(
 		(scoped) => `${canonicalModel(scoped.model)}${scoped.thinkingLevel ? `:${scoped.thinkingLevel}` : ""}`,
 	);
-	let description = lead;
+	let description = `${base} Preferred available choices: `;
 	for (const [index, choice] of choices.entries()) {
 		const separator = index === 0 ? "" : ", ";
-		const suffix = index === choices.length - 1 ? "." : ", …";
-		if (`${description}${separator}${choice}${suffix}`.length > MAX_CREATE_DESCRIPTION_LENGTH) break;
+		if (`${description}${separator}${choice}, …`.length > MAX_CREATE_DESCRIPTION_LENGTH) break;
 		description += `${separator}${choice}`;
 	}
-	if (description === lead) return `${lead.slice(0, MAX_CREATE_DESCRIPTION_LENGTH - 1)}…`;
-	return `${description}${description.endsWith(choices.at(-1) ?? "") ? "." : ", …"}`;
+	return `${description}${description.endsWith(choices.at(-1) ?? "") ? "." : ", …"}`.slice(0, MAX_CREATE_DESCRIPTION_LENGTH);
 }
 
 export default function SubagentExtension(pi: ExtensionAPI): void {
@@ -79,14 +79,19 @@ export default function SubagentExtension(pi: ExtensionAPI): void {
 	});
 
 	let supervisor: SubagentSupervisor | undefined;
+	const createCards = new CreateCardRegistry();
 	const dashboardWidgetKey = "subagent-dashboard";
-
+	const requireSupervisor = () => {
+		if (!supervisor) throw new Error("Subagent supervisor is not initialized for this session");
+		return supervisor;
+	};
 	const clearDashboard = (context: ExtensionContext) => {
+		createCards.clear();
 		if (context.mode === "tui") context.ui.setWidget(dashboardWidgetKey, undefined);
 	};
-
 	const installDashboard = (context: ExtensionContext, current: SubagentSupervisor) => {
 		if (context.mode !== "tui") return;
+		createCards.update(current.getDashboardChildren().map((child) => child.snapshot));
 		context.ui.setWidget(dashboardWidgetKey, (tui, theme) => {
 			const dashboard = new SubagentDashboard(
 				() => current.getDashboardChildren(),
@@ -96,6 +101,7 @@ export default function SubagentExtension(pi: ExtensionAPI): void {
 				() => current.registerDashboardInvalidator(undefined),
 			);
 			current.registerDashboardInvalidator(() => {
+				createCards.update(current.getDashboardChildren().map((child) => child.snapshot));
 				dashboard.invalidate();
 				tui.requestRender();
 			});
@@ -103,38 +109,64 @@ export default function SubagentExtension(pi: ExtensionAPI): void {
 		});
 	};
 
-	const requireSupervisor = (): SubagentSupervisor => {
-		if (!supervisor) throw new Error("Subagent supervisor is not initialized for this session");
-		return supervisor;
-	};
-
 	const registerCreateTool = (context: ModelDiscoveryContext, model = context.model) => {
 		pi.registerTool({
 			name: "subagent_create",
 			label: "Subagent Create",
 			description: buildSubagentCreateDescription(model, context.scopedModels),
-			promptSnippet: "Create a persistent background subagent with isolated context",
+			promptSnippet: "Create an isolated child or continuation; wait by default",
 			promptGuidelines: [
-				"Use subagent_create for bounded parallel work that benefits from an isolated conversation context.",
-				"Use subagent_wait or subagent_list instead of polling subagents repeatedly.",
+				"Use subagent_create for bounded work that benefits from isolated context or a different model/effort.",
+				"For 2 or more independent tasks, emit only their subagent_create calls as siblings in one response so wait-mode children run concurrently; use management tools in a later turn.",
+				"Use from with a stopped child ID to answer a question or continue retained history.",
+				"Use background mode only when the parent must continue before that child stops; then join it with subagent_wait.",
 			],
 			parameters: SubagentCreateParams,
-			executionMode: "sequential",
-			execute: async (_toolCallId, params, signal) =>
-				requireSupervisor().createSubagent(ROOT_CALLER_ID, params, signal),
+			executionMode: "parallel",
+			execute: async (_id, params, signal, onUpdate) =>
+				requireSupervisor().createSubagent(ROOT_CALLER_ID, params, signal, onUpdate),
 			renderCall(args, theme, renderContext) {
-				const prompt = args.context ? `${args.context}\n\n${args.task}` : args.task;
-				return renderStaticSubagentCall(
-					"create",
-					args.name?.trim() || "new subagent",
-					prompt,
+				const live = ((renderContext.state ?? {}) as CreateCardState).snapshot;
+				const parentCwd = context.cwd ?? ".";
+				const parentModel = model ? canonicalModel(model) : "default";
+				const parentThinking = context.thinkingLevel ?? pi.getThinkingLevel?.() ?? "off";
+				const childCwd = live?.cwd ?? args.cwd ?? parentCwd;
+				const childModel = live?.model ?? args.model ?? parentModel;
+				const childThinking = live?.thinking_level ?? args.thinking_level ?? parentThinking;
+				return renderSubagentCreateCall(
+					{
+						name: live?.name ?? args.name,
+						from: live?.from ?? args.from,
+						mode: args.mode ?? "wait",
+						systemPrompt: args.system_prompt,
+						context: args.context,
+						task: args.task,
+						cwd: resolve(parentCwd, childCwd) === resolve(parentCwd) ? undefined : relativeCwd(parentCwd, childCwd),
+						model: childModel === parentModel ? undefined : childModel,
+						thinkingLevel: childThinking === parentThinking ? undefined : childThinking,
+						timeoutSeconds: live?.timeout_seconds ?? args.limits?.timeout_seconds,
+					},
 					theme,
 					renderContext.expanded,
 					renderContext.lastComponent,
 				);
 			},
-			renderResult(result, _options, theme) {
-				return renderStaticSubagentResult(result.details as SubagentToolDetails | undefined, theme);
+			renderResult(result, options, theme, renderContext) {
+				const rawDetails = result.details as CreateSubagentDetails | undefined;
+				const details = rawDetails ? createCards.bind(rawDetails, renderContext.invalidate) : undefined;
+				const state = (renderContext.state ?? {}) as CreateCardState;
+				if (details?.snapshot && state.snapshot !== details.snapshot) {
+					state.snapshot = details.snapshot;
+					queueMicrotask(() => renderContext.invalidate?.());
+				}
+				return renderSubagentCreateResult(
+					details,
+					theme,
+					options.expanded,
+					options.isPartial,
+					renderContext.isError,
+					renderContext.lastComponent,
+				);
 			},
 		});
 	};
@@ -142,84 +174,85 @@ export default function SubagentExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "subagent_list",
 		label: "Subagent List",
-		description: "List event-derived status snapshots for matching subagents without invoking another model.",
-		promptSnippet: "Inspect current subagent states and activity",
+		description: "List event-derived snapshots of running or stopped subagents without invoking another model.",
+		promptSnippet: "Inspect subagent state, lineage, activity, handoff, and errors",
 		parameters: SubagentListParams,
-		execute: async (_toolCallId, params) => requireSupervisor().listSubagents(ROOT_CALLER_ID, params),
-		renderResult(result, _options, theme) {
-			const details = result.details as ListSubagentsDetails | undefined;
-			if (!details) return new Text(theme.fg("muted", "No subagent details"), 0, 0);
-			const lines = details.snapshots.map(
-				(snapshot) =>
-					`${theme.fg("accent", snapshot.name)} ${theme.fg("muted", snapshot.state)} ${theme.fg("dim", `turn ${snapshot.turns}`)}`,
-			);
-			return new Text(lines.join("\n") || theme.fg("dim", "No matching subagents"), 0, 0);
-		},
-	});
-
-	pi.registerTool({
-		name: "subagent_send",
-		label: "Subagent Send",
-		description:
-			"Answer, steer, queue a follow-up, or continue a retained subagent. Auto steers running children and starts a new run for idle children.",
-		promptSnippet: "Send context or continue a persistent subagent",
-		parameters: SubagentSendParams,
-		executionMode: "sequential",
-		execute: async (_toolCallId, params, signal) => requireSupervisor().sendSubagent(ROOT_CALLER_ID, params, signal),
+		execute: async (_id, params) => requireSupervisor().listSubagents(ROOT_CALLER_ID, params),
 		renderCall(args, theme, renderContext) {
-			return renderStaticSubagentCall(
-				"send",
-				args.name,
-				args.message,
+			return renderSubagentListCall(
+				{ states: args.states, detail: args.detail ?? "standard" },
 				theme,
-				renderContext.expanded,
 				renderContext.lastComponent,
 			);
 		},
-		renderResult(result, _options, theme) {
-			return renderStaticSubagentResult(result.details as SubagentToolDetails | undefined, theme);
+		renderResult(result, options, theme, renderContext) {
+			return renderSubagentListResult(
+				result.details as ListSubagentsDetails | undefined,
+				renderContext.args.detail ?? "standard",
+				theme,
+				options.expanded,
+				renderContext.lastComponent,
+			);
 		},
 	});
 
 	pi.registerTool({
 		name: "subagent_wait",
 		label: "Subagent Wait",
-		description:
-			"Wait by subscription for selected subagents to reach requested states; streams compact updates while waiting.",
-		promptSnippet: "Wait for subagent state changes without polling",
+		description: "Wait for any or all selected background subagents to stop. A timeout releases only the parent wait.",
+		promptSnippet: "Join any or all background subagents",
 		parameters: SubagentWaitParams,
-		execute: async (_toolCallId, params, signal, onUpdate) =>
+		execute: async (_id, params, signal, onUpdate) =>
 			requireSupervisor().waitSubagents(ROOT_CALLER_ID, params, signal, onUpdate),
-		renderResult(result, options, theme) {
+		renderCall(args, theme, renderContext) {
+			const details = ((renderContext.state ?? {}) as WaitCardState).details;
+			return renderSubagentWaitCall(
+				{ names: args.names, waitFor: args.for ?? "all", timeoutSeconds: args.timeout_seconds, details },
+				theme,
+				renderContext.lastComponent,
+			);
+		},
+		renderResult(result, options, theme, renderContext) {
 			const details = result.details as WaitSubagentsDetails | undefined;
-			const status = details?.matched
-				? `${details.matched.name}: ${details.matched.state}`
-				: `wait ${details?.reason ?? "pending"}`;
-			const color =
-				options.isPartial || details?.reason === "pending"
-					? "muted"
-					: details?.reason === "event"
-						? "success"
-						: "muted";
-			return new Text(theme.fg(color, status), 0, 0);
+			const state = (renderContext.state ?? {}) as WaitCardState;
+			if (details && state.details !== details) {
+				state.details = details;
+				queueMicrotask(() => renderContext.invalidate?.());
+			}
+			return renderSubagentWaitResult(
+				details,
+				renderContext.args.timeout_seconds,
+				theme,
+				options.expanded,
+				renderContext.isError,
+				renderContext.lastComponent,
+			);
 		},
 	});
 
 	pi.registerTool({
 		name: "subagent_stop",
 		label: "Subagent Stop",
-		description: "Reversibly stop a subagent and retain its context for later resumption.",
-		promptSnippet: "Reversibly stop a subagent",
+		description: "Abort an active subagent and retain its durable history for a new continuation.",
+		promptSnippet: "Stop active work while retaining history",
 		parameters: SubagentStopParams,
-		execute: async (_toolCallId, params, signal) => requireSupervisor().stopSubagent(ROOT_CALLER_ID, params, signal),
-		renderResult(result, _options, theme) {
-			const details = result.details as StopSubagentDetails | undefined;
-			return new Text(
-				details
-					? `${theme.fg("accent", details.snapshot.name)} ${theme.fg("muted", details.snapshot.state)}`
-					: theme.fg("muted", "Subagent stopped"),
-				0,
-				0,
+		execute: async (_id, params, signal, onUpdate) =>
+			requireSupervisor().stopSubagent(ROOT_CALLER_ID, params, signal, onUpdate),
+		renderCall(args, theme, renderContext) {
+			return renderSubagentStopCall(
+				{ name: args.name, reason: args.reason },
+				theme,
+				renderContext.expanded,
+				renderContext.lastComponent,
+			);
+		},
+		renderResult(result, options, theme, renderContext) {
+			return renderSubagentStopResult(
+				result.details as StopSubagentDetails | undefined,
+				theme,
+				options.expanded,
+				renderContext.isError,
+				renderContext.lastComponent,
 			);
 		},
 	});
@@ -228,30 +261,19 @@ export default function SubagentExtension(pi: ExtensionAPI): void {
 		renderSubagentNotificationCard(String(message.content), theme, options.expanded),
 	);
 
-	pi.on("session_start", (_event, context) => {
-		registerCreateTool(context as ModelDiscoveryContext);
-	});
-
-	pi.on("model_select", (event, context) => {
-		registerCreateTool(context as ModelDiscoveryContext, event.model);
-	});
-
-	pi.on("agent_settled", () => {
-		supervisor?.remindWaitingDescendants();
-	});
-
+	pi.on("session_start", (_event, context) => registerCreateTool(context as ModelDiscoveryContext));
+	pi.on("model_select", (event, context) => registerCreateTool(context as ModelDiscoveryContext, event.model));
+	pi.on("agent_settled", () => supervisor?.remindRunningDescendants());
 	pi.on("session_start", async (_event, context) => {
 		supervisor = await SubagentSupervisor.create(pi, context);
 		installDashboard(context, supervisor);
 	});
-
 	pi.on("session_tree", async (_event, context) => {
 		clearDashboard(context);
 		await supervisor?.shutdown(false);
 		supervisor = await SubagentSupervisor.create(pi, context);
 		installDashboard(context, supervisor);
 	});
-
 	pi.on("session_shutdown", async (_event, context) => {
 		clearDashboard(context);
 		await supervisor?.shutdown();

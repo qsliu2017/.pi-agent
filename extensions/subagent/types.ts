@@ -1,14 +1,13 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 
 export const ROOT_CALLER_ID = "<parent>";
-export const REGISTRY_ENTRY_TYPE = "subagent.registry.v1";
+export const REGISTRY_ENTRY_TYPE = "subagent.registry.v2";
 export const NOTIFICATION_MESSAGE_TYPE = "subagent.notification.v1";
 
-export type SubagentState = "creating" | "running" | "stopping" | "waiting_parent" | "completed" | "failed" | "paused";
-
-export type WaitEvent = "waiting_parent" | "completed" | "failed" | "paused";
-export type YieldStatus = "completed" | "needs_input" | "blocked";
-export type DeliveryMode = "auto" | "steer" | "follow_up";
+export type SubagentState = "running" | "stopped";
+export type SubagentMode = "wait" | "background";
+export type WaitFor = "any" | "all";
+export type StopReason = "finished" | "error" | "timeout" | "requested" | "cancelled" | "recovered";
 
 export interface SubagentLimits {
 	timeoutSeconds?: number;
@@ -51,35 +50,30 @@ export interface TurnView {
 export interface SubagentSnapshot {
 	id: string;
 	name: string;
+	from?: string;
 	state: SubagentState;
 	model: string;
 	thinking_level: ThinkingLevel;
+	cwd: string;
+	timeout_seconds?: number;
 	elapsed_ms: number;
 	idle_ms: number;
 	turns: number;
 	current_activity?: CurrentActivity;
 	last_text_preview?: string;
-	pending_question?: string;
+	final_response?: string;
 	error?: string;
+	stop_reason?: StopReason;
+	stop_message?: string;
+	stopped_at?: number;
 	usage: UsageSnapshot;
-}
-
-export interface YieldRecord {
-	status: YieldStatus;
-	content: string;
-	at: number;
-}
-
-export interface PendingNotification {
-	id: string;
-	content: string;
-	createdAt: number;
 }
 
 export interface PersistedChild {
 	id: string;
 	name: string;
 	parentId: string | null;
+	fromId?: string;
 	depth: number;
 	remainingDepth: number;
 	childSessionId: string;
@@ -91,34 +85,37 @@ export interface PersistedChild {
 	modelProvider: string;
 	modelId: string;
 	thinkingLevel: ThinkingLevel;
+	rolePrompt?: string;
 	generatedSystemPrompt: string;
 	enabledTools: string[];
 	limits: SubagentLimits;
 	state: SubagentState;
+	stopReason?: StopReason;
+	stopMessage?: string;
+	finalResponse?: string;
+	error?: string;
 	turns: number;
 	createdAt: number;
 	updatedAt: number;
 	lastActivityAt: number;
 	dashboardOrder: number;
-	cumulativeActiveMs: number;
+	activeMs: number;
 	usage: UsageSnapshot;
 	latestTurns: TurnView[];
-	pendingNotifications: PendingNotification[];
-	pendingQuestion?: string;
-	lastYield?: YieldRecord;
-	error?: string;
+	notifyOnStop: boolean;
 }
 
 export interface PersistedRegistry {
-	version: 1;
+	version: 2;
 	ownerSessionId: string;
 	sequence: number;
 	dashboardOrderSequence: number;
 	children: PersistedChild[];
 }
 
-export interface SubagentToolDetails {
-	action: "create" | "send";
+export interface CreateSubagentDetails {
+	action: "create";
+	mode: SubagentMode;
 	childId: string;
 	acceptedAt: number;
 	snapshot: SubagentSnapshot;
@@ -135,8 +132,13 @@ export interface ListSubagentsDetails {
 }
 
 export interface WaitSubagentsDetails {
-	reason: "pending" | "event" | "timeout" | "cancelled";
+	reason: "pending" | "settled" | "timeout" | "cancelled";
+	started_at: number;
+	elapsed_ms: number;
+	waitFor: WaitFor;
 	snapshots: SubagentSnapshot[];
+	settled: number;
+	total: number;
 	matched?: SubagentSnapshot;
 }
 

@@ -1,8 +1,8 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import type { DashboardChildView, SubagentSnapshot, SubagentToolDetails, TurnView } from "./types.ts";
+import type { DashboardChildView, SubagentSnapshot, TurnView } from "./types.ts";
 
-const LIVING_STATES = new Set(["creating", "running", "stopping", "waiting_parent"]);
+const LIVING_STATES = new Set(["running"]);
 const EXPANDED_TURN_LIMIT = 5;
 
 function singleLine(text: string | undefined, fallback = ""): string {
@@ -46,13 +46,10 @@ function expandedTurnTexts(turn: TurnView): string[] {
 
 function modelText(snapshot: SubagentSnapshot): string {
 	const model = snapshot.model.split("/").at(-1) ?? snapshot.model;
-	return snapshot.thinking_level === "off" ? model : `${model}:${snapshot.thinking_level}`;
+	return `${model} ${snapshot.thinking_level}`;
 }
 
 function collapsedActivity(snapshot: SubagentSnapshot, turns: TurnView[]): string {
-	if (snapshot.state === "waiting_parent") return "waiting for parent";
-	if (snapshot.state === "stopping") return "stopping";
-	if (snapshot.state === "creating") return "creating";
 	if (snapshot.current_activity) {
 		if (snapshot.current_activity.type === "tool" && snapshot.current_activity.name) {
 			const prefix = snapshot.current_activity.name === "bash" ? "$" : snapshot.current_activity.name;
@@ -64,9 +61,7 @@ function collapsedActivity(snapshot: SubagentSnapshot, turns: TurnView[]): strin
 	return turn ? primaryTurnText(turn) : singleLine(snapshot.last_text_preview, "starting");
 }
 
-function stateAppearance(snapshot: SubagentSnapshot): { color: "warning" | "muted"; symbol: string } {
-	if (snapshot.state === "waiting_parent") return { color: "warning", symbol: "?" };
-	if (snapshot.state === "stopping") return { color: "muted", symbol: "■" };
+function stateAppearance(_snapshot: SubagentSnapshot): { color: "warning"; symbol: string } {
 	return { color: "warning", symbol: "●" };
 }
 
@@ -86,9 +81,6 @@ function expandedChildLines(view: DashboardChildView, theme: Theme): string[] {
 		}
 	}
 	if (turns.length === 0) lines.push(theme.fg("dim", `     ${collapsedActivity(view.snapshot, view.turns)}`));
-	if (view.snapshot.pending_question) {
-		lines.push(theme.fg("warning", `     question: ${singleLine(view.snapshot.pending_question)}`));
-	}
 	if (view.snapshot.error) lines.push(theme.fg("error", `     error: ${singleLine(view.snapshot.error)}`));
 	const usage = view.snapshot.usage;
 	const totalTokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
@@ -200,6 +192,22 @@ export class SubagentDashboard implements Component {
 	}
 }
 
+interface NotificationItem {
+	name?: string;
+	id?: string;
+	state?: string;
+	body: string;
+}
+
+function parseNotifications(content: string): NotificationItem[] {
+	const pattern = /\[subagent\s+(.+?)\s+\(([^)]+)\)\]\s+state=([^\s]+)\n?([\s\S]*?)(?=\n\n\[subagent\s|$)/g;
+	const items: NotificationItem[] = [];
+	for (const match of content.matchAll(pattern)) {
+		items.push({ name: match[1], id: match[2], state: match[3], body: match[4]?.trim() ?? "" });
+	}
+	return items.length > 0 ? items : [{ body: content.trim() }];
+}
+
 export class SubagentNotificationCard implements Component {
 	private content: string;
 	private theme: Theme;
@@ -221,7 +229,6 @@ export class SubagentNotificationCard implements Component {
 	}
 
 	render(width: number): string[] {
-		if (!this.expanded) return [];
 		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
 		const availableWidth = Math.max(1, Math.floor(width));
 		const header = truncateToWidth(this.theme.fg("accent", this.theme.bold("╭─ Subagent update")), availableWidth);
@@ -229,9 +236,20 @@ export class SubagentNotificationCard implements Component {
 		const prefixText = availableWidth >= 3 ? "│ " : availableWidth === 2 ? "│" : "";
 		const prefix = prefixText ? this.theme.fg("accent", prefixText) : "";
 		const bodyWidth = Math.max(1, availableWidth - prefixText.length);
-		const body = wrapTextWithAnsi(this.theme.fg("customMessageText", this.content), bodyWidth).map(
-			(line) => `${prefix}${line}`,
-		);
+		const body: string[] = [];
+		for (const item of parseNotifications(this.content)) {
+			if (item.name && item.id && item.state) {
+				body.push(`${prefix}${truncateToWidth(this.theme.fg("toolTitle", `${item.name} ${item.id} ${item.state}`), bodyWidth)}`);
+			}
+			if (item.body) {
+				const wrapped = wrapTextWithAnsi(this.theme.fg("customMessageText", item.body), bodyWidth);
+				const visible = this.expanded ? wrapped : wrapped.slice(0, 1);
+				if (!this.expanded && wrapped.length > 1 && visible.length > 0) {
+					visible[0] = `${truncateToWidth(visible[0] ?? "", Math.max(1, bodyWidth - 1), "")}${this.theme.fg("dim", "…")}`;
+				}
+				body.push(...visible.map((line) => `${prefix}${line}`));
+			}
+		}
 		this.cachedWidth = width;
 		this.cachedLines = [header, ...body, footer];
 		return this.cachedLines;
@@ -255,106 +273,4 @@ export function renderSubagentNotificationCard(
 			: new SubagentNotificationCard(content, theme, expanded);
 	component.update(content, theme, expanded);
 	return component;
-}
-
-class StaticToolLine implements Component {
-	private readonly text: string;
-	private cachedWidth: number | undefined;
-	private cachedLines: string[] | undefined;
-
-	constructor(text: string) {
-		this.text = text;
-	}
-
-	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-		this.cachedWidth = width;
-		this.cachedLines = [truncateToWidth(this.text, Math.max(1, width))];
-		return this.cachedLines;
-	}
-
-	invalidate(): void {
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-	}
-}
-
-const COLLAPSED_PROMPT_LINES = 3;
-
-class StaticSubagentCall implements Component {
-	private action: "create" | "send";
-	private name: string;
-	private content: string;
-	private theme: Theme;
-	private expanded: boolean;
-	private cachedWidth: number | undefined;
-	private cachedLines: string[] | undefined;
-
-	constructor(action: "create" | "send", name: string, content: string, theme: Theme, expanded: boolean) {
-		this.action = action;
-		this.name = name;
-		this.content = content;
-		this.theme = theme;
-		this.expanded = expanded;
-	}
-
-	update(action: "create" | "send", name: string, content: string, theme: Theme, expanded: boolean): void {
-		this.action = action;
-		this.name = name;
-		this.content = content;
-		this.theme = theme;
-		this.expanded = expanded;
-		this.invalidate();
-	}
-
-	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-
-		const availableWidth = Math.max(1, width);
-		const toolName = this.action === "create" ? "subagent_create" : "subagent_send";
-		const header = truncateToWidth(
-			`${this.theme.fg("toolTitle", this.theme.bold(toolName))} ${this.theme.fg("accent", singleLine(this.name))}`,
-			availableWidth,
-		);
-		const completeBody = wrapTextWithAnsi(this.theme.fg("dim", this.content), availableWidth);
-		const body = this.expanded ? completeBody : completeBody.slice(0, COLLAPSED_PROMPT_LINES);
-		if (!this.expanded && completeBody.length > COLLAPSED_PROMPT_LINES) {
-			const lastIndex = body.length - 1;
-			body[lastIndex] =
-				`${truncateToWidth(body[lastIndex] ?? "", availableWidth - 1, "")}${this.theme.fg("dim", "…")}`;
-		}
-
-		this.cachedWidth = width;
-		this.cachedLines = [header, ...body];
-		return this.cachedLines;
-	}
-
-	invalidate(): void {
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-	}
-}
-
-export function renderStaticSubagentCall(
-	action: "create" | "send",
-	name: string,
-	content: string,
-	theme: Theme,
-	expanded = false,
-	lastComponent?: Component,
-): Component {
-	const component =
-		lastComponent instanceof StaticSubagentCall
-			? lastComponent
-			: new StaticSubagentCall(action, name, content, theme, expanded);
-	component.update(action, name, content, theme, expanded);
-	return component;
-}
-
-export function renderStaticSubagentResult(details: SubagentToolDetails | undefined, theme: Theme): Component {
-	if (!details) return new StaticToolLine(theme.fg("muted", "Subagent acknowledgement unavailable"));
-	const verb = details.action === "create" ? "Created" : "Sent to";
-	return new StaticToolLine(
-		`${theme.fg("success", verb)} ${theme.fg("accent", details.snapshot.name)} ${theme.fg("muted", `(${details.childId}) · ${details.snapshot.state}`)}`,
-	);
 }

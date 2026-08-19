@@ -1,22 +1,13 @@
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-	MessageRenderer,
-	Theme,
-	ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
-import { type Component, visibleWidth } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext, MessageRenderer, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { describe, expect, test, vi } from "vitest";
-import { stripAnsi } from "../../../src/utils/ansi.ts";
-import subagentSdkExtension, { buildSubagentCreateDescription } from "./index.ts";
-import { SubagentListParams, SubagentStopParams } from "./schemas.ts";
+import subagentExtension, { buildSubagentCreateDescription } from "./index.ts";
+import { SubagentCreateParams, SubagentListParams, SubagentWaitParams } from "./schemas.ts";
 import { NOTIFICATION_MESSAGE_TYPE } from "./types.ts";
 
 vi.mock("@earendil-works/pi-ai", () => ({
-	StringEnum: (values: readonly string[]) => Type.String({ enum: [...values] }),
+	StringEnum: (values: readonly string[], options?: object) => Type.String({ enum: [...values], ...options }),
 }));
 
 vi.mock("./supervisor.ts", () => ({
@@ -25,246 +16,181 @@ vi.mock("./supervisor.ts", () => ({
 	SubagentSupervisor: { create: vi.fn() },
 }));
 
-type CapturedHandler = (event: unknown, context: ExtensionContext) => Promise<unknown> | unknown;
-type ScopedModel = { model: Model<Api>; thinkingLevel?: ThinkingLevel };
+type Handler = (event: any, context: ExtensionContext) => unknown;
 
-function model(provider: string, id: string): Model<Api> {
+function model(provider = "openai", id = "gpt-test"): Model<Api> {
 	return { provider, id } as Model<Api>;
 }
 
-function context(currentModel: Model<Api>, scopedModels: ScopedModel[] = []): ExtensionContext {
-	return { model: currentModel, scopedModels } as unknown as ExtensionContext;
-}
-
-function captureExtension(): {
+function capture(): {
 	tools: ToolDefinition[];
-	handlers: Map<string, CapturedHandler[]>;
-	messageRenderers: Map<string, MessageRenderer>;
+	handlers: Map<string, Handler[]>;
+	renderers: Map<string, MessageRenderer>;
+	flags: Map<string, unknown>;
 } {
 	const tools: ToolDefinition[] = [];
-	const handlers = new Map<string, CapturedHandler[]>();
-	const messageRenderers = new Map<string, MessageRenderer>();
+	const handlers = new Map<string, Handler[]>();
+	const renderers = new Map<string, MessageRenderer>();
+	const flags = new Map<string, unknown>();
 	const pi = {
-		registerFlag: () => {},
 		registerTool: (tool: ToolDefinition) => tools.push(tool),
-		registerMessageRenderer: (customType: string, renderer: MessageRenderer) => {
-			messageRenderers.set(customType, renderer);
-		},
-		on: (event: string, handler: CapturedHandler) => {
-			const registered = handlers.get(event) ?? [];
-			registered.push(handler);
-			handlers.set(event, registered);
-		},
+		registerFlag: (name: string, value: unknown) => flags.set(name, value),
+		registerMessageRenderer: (name: string, renderer: MessageRenderer) => renderers.set(name, renderer),
+		on: (event: string, handler: Handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 	} as unknown as ExtensionAPI;
-
-	subagentSdkExtension(pi);
-	return { tools, handlers, messageRenderers };
+	subagentExtension(pi);
+	return { tools, handlers, renderers, flags };
 }
 
-function requireHandler(handlers: Map<string, CapturedHandler[]>, event: string, index = 0): CapturedHandler {
-	const handler = handlers.get(event)?.[index];
-	if (!handler) throw new Error(`Missing ${event} handler ${index}`);
-	return handler;
-}
-
-const renderTheme = {
+const theme = {
 	fg: (_color: string, text: string) => text,
 	bold: (text: string) => text,
 } as unknown as Theme;
 
-function renderToolCall(tool: ToolDefinition, args: unknown, expanded: boolean, lastComponent?: Component): Component {
-	if (!tool.renderCall) throw new Error(`Missing ${tool.name} renderCall`);
-	return tool.renderCall(args as never, renderTheme, { expanded, lastComponent } as never);
+function registerCreate(result: ReturnType<typeof capture>): ToolDefinition {
+	const handler = result.handlers.get("session_start")?.[0];
+	if (!handler) throw new Error("Missing session_start create registration");
+	handler({ reason: "startup" }, { cwd: "/repo", model: model(), scopedModels: [] } as unknown as ExtensionContext);
+	const tool = result.tools.find((candidate) => candidate.name === "subagent_create");
+	if (!tool) throw new Error("Missing create tool");
+	return tool;
 }
 
-function renderNotification(
-	renderer: MessageRenderer,
-	content: string,
-	expanded: boolean,
-	width: number,
-	theme: Theme = renderTheme,
-): string[] {
-	const component = renderer(
-		{ role: "custom", customType: NOTIFICATION_MESSAGE_TYPE, content, display: true, timestamp: 1 },
-		{ expanded },
-		theme,
-	);
-	if (!component) throw new Error("Notification renderer returned no component");
-	return component.render(width);
-}
-
-describe("notification message renderer registration", () => {
-	test("registers the expandable renderer for NOTIFICATION_MESSAGE_TYPE", () => {
-		const { messageRenderers } = captureExtension();
-		const renderer = messageRenderers.get(NOTIFICATION_MESSAGE_TYPE);
-		if (!renderer) throw new Error("Missing notification message renderer");
-
-		expect([...messageRenderers.keys()]).toContain(NOTIFICATION_MESSAGE_TYPE);
-		expect(renderNotification(renderer, "worker completed", false, 80)).toEqual([]);
-		expect(renderNotification(renderer, "worker completed", true, 80).map(stripAnsi)).toEqual([
-			"╭─ Subagent update",
-			"│ worker completed",
-			"╰─",
-		]);
-	});
-
-	test("registered renderer wraps ANSI-styled content within narrow visible widths", () => {
-		const renderer = captureExtension().messageRenderers.get(NOTIFICATION_MESSAGE_TYPE);
-		if (!renderer) throw new Error("Missing notification message renderer");
-		const ansiTheme = {
-			fg: (_color: string, text: string) => `\u001b[35m${text}\u001b[39m`,
-			bold: (text: string) => `\u001b[1m${text}\u001b[22m`,
-		} as unknown as Theme;
-		const lines = renderNotification(renderer, "alpha beta gamma", true, 10, ansiTheme);
-
-		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(10);
-		expect(lines.slice(1, -1).map(stripAnsi)).toEqual(["│ alpha", "│ beta", "│ gamma"]);
-	});
-});
-
-describe("subagent_create model discovery", () => {
-	test("registers the initial description on session start with the current canonical parent model", () => {
-		const { tools, handlers } = captureExtension();
-		expect(tools.map((tool) => tool.name)).toEqual([
+describe("tool surface", () => {
+	test("exposes only create, wait, list, and stop", () => {
+		const result = capture();
+		expect(result.tools.map((tool) => tool.name)).toEqual(["subagent_list", "subagent_wait", "subagent_stop"]);
+		registerCreate(result);
+		expect(result.tools.map((tool) => tool.name).sort()).toEqual([
+			"subagent_create",
 			"subagent_list",
-			"subagent_send",
-			"subagent_wait",
 			"subagent_stop",
+			"subagent_wait",
 		]);
-
-		requireHandler(handlers, "session_start")(
-			{ type: "session_start", reason: "startup" },
-			context(model("anthropic", "claude-sonnet-4-5")),
-		);
-
-		const create = tools.at(-1);
-		expect(create?.name).toBe("subagent_create");
-		expect(create?.description).toContain(
-			"Omitting model inherits the current parent model (anthropic/claude-sonnet-4-5).",
-		);
-		expect(create?.description).not.toContain("Preferred available choices");
-		expect(create?.executionMode).toBe("sequential");
-		expect(create?.renderCall).toBeTypeOf("function");
-		expect(create?.renderResult).toBeTypeOf("function");
 	});
 
-	test("re-registers the description with the newly selected model", () => {
-		const { tools, handlers } = captureExtension();
-		const previous = model("anthropic", "claude-sonnet-4-5");
-		const next = model("openai", "gpt-5.4");
-		requireHandler(handlers, "session_start")({ type: "session_start", reason: "startup" }, context(previous));
-		requireHandler(handlers, "model_select")(
-			{ type: "model_select", model: next, previousModel: previous, source: "set" },
-			context(previous),
-		);
-
-		const registrations = tools.filter((tool) => tool.name === "subagent_create");
-		expect(registrations).toHaveLength(2);
-		expect(registrations[1]?.description).toContain("current parent model (openai/gpt-5.4)");
-		expect(registrations[1]?.description).not.toContain("anthropic/claude-sonnet-4-5");
-	});
-
-	test("formats scoped models canonically and includes only pinned thinking levels", () => {
-		const description = buildSubagentCreateDescription(model("openai", "gpt-5.4"), [
-			{ model: model("anthropic", "claude-opus-4-6"), thinkingLevel: "high" },
-			{ model: model("openai", "gpt-5.4") },
-			{ model: model("google", "gemini-3-pro"), thinkingLevel: "low" },
+	test("defines the redesigned schemas", () => {
+		const create = JSON.parse(JSON.stringify(SubagentCreateParams));
+		expect(Object.keys(create.properties)).toEqual([
+			"task",
+			"from",
+			"mode",
+			"name",
+			"model",
+			"thinking_level",
+			"system_prompt",
+			"tools",
+			"cwd",
+			"context",
+			"limits",
 		]);
-
-		expect(description).toContain(
-			"Preferred available choices: anthropic/claude-opus-4-6:high, openai/gpt-5.4, google/gemini-3-pro:low.",
-		);
+		expect(create.properties.mode.enum).toEqual(["wait", "background"]);
+		const wait = JSON.parse(JSON.stringify(SubagentWaitParams));
+		expect(Object.keys(wait.properties)).toEqual(["names", "for", "timeout_seconds"]);
+		expect(wait.properties.for.enum).toEqual(["any", "all"]);
+		expect(JSON.stringify(SubagentListParams)).toContain('"running"');
+		expect(JSON.stringify(SubagentListParams)).toContain('"stopped"');
 	});
 
-	test("bounds descriptions with large scoped model sets", () => {
-		const scopedModels = Array.from({ length: 500 }, (_, index) => ({
-			model: model("provider", `model-${index}-${"x".repeat(40)}`),
-			thinkingLevel: index === 0 ? ("xhigh" as const) : undefined,
-		}));
-		const description = buildSubagentCreateDescription(model("provider", "parent"), scopedModels);
+	test("marks create explicitly parallel and strongly prompts sibling batching", () => {
+		const create = registerCreate(capture());
+		expect(create.executionMode).toBe("parallel");
+		expect(create.promptGuidelines?.join(" ")).toContain("as siblings in one response");
+		expect(create.description).toContain("Waits by default");
+	});
 
-		expect(description.length).toBeLessThanOrEqual(2_000);
-		expect(description).toContain("provider/model-0-");
-		expect(description).toContain(":xhigh");
-		expect(description).toMatch(/, …$/);
+	test("registers flags and the outstanding-work reminder hook", () => {
+		const result = capture();
+		expect(result.flags.get("subagent-max-depth")).toMatchObject({ default: "3" });
+		expect(result.flags.get("subagent-max-concurrency")).toMatchObject({ default: "4" });
+		expect(result.handlers.get("agent_settled")).toHaveLength(1);
 	});
 });
 
-describe("pause-only lifecycle tools", () => {
-	test("does not expose permanent termination or the closed state to models", () => {
-		const stopSchema = JSON.parse(JSON.stringify(SubagentStopParams)) as {
-			properties: Record<string, unknown>;
-		};
-		expect(Object.keys(stopSchema.properties)).toEqual(["name", "reason"]);
-
-		const listSchema = JSON.stringify(SubagentListParams);
-		expect(listSchema).not.toContain("terminate");
-		expect(listSchema).not.toContain("closed");
+describe("descriptions and rendering", () => {
+	test("includes inherited and scoped model choices", () => {
+		const description = buildSubagentCreateDescription(model("openai", "gpt-parent"), [
+			{ model: model("anthropic", "claude"), thinkingLevel: "high" },
+		]);
+		expect(description).toContain("openai/gpt-parent");
+		expect(description).toContain("anthropic/claude:high");
 	});
 
-	test("describes stop as reversible pause-only lifecycle control", () => {
-		const { tools } = captureExtension();
-		const stop = tools.find((tool) => tool.name === "subagent_stop");
-		if (!stop) throw new Error("Missing subagent_stop tool");
-
-		expect(stop.description.toLowerCase()).toMatch(/reversibl/);
-		expect(stop.description.toLowerCase()).not.toContain("terminate");
-		expect(stop.description.toLowerCase()).not.toContain("permanent");
-		expect(stop.promptSnippet?.toLowerCase()).not.toContain("terminate");
-	});
-
-	test("registers a parent-settlement hook for repeat waiting-parent reminders", () => {
-		const { handlers } = captureExtension();
-		expect(handlers.get("agent_settled")).toHaveLength(1);
-	});
-});
-
-describe("subagent static call cards", () => {
-	test("renders create context before the task and expands to the complete composed prompt", () => {
-		const { tools, handlers } = captureExtension();
-		requireHandler(handlers, "session_start")(
-			{ type: "session_start", reason: "startup" },
-			context(model("openai", "gpt-5.4")),
+	test("renders continuation and background mode on create calls", async () => {
+		const create = registerCreate(capture());
+		if (!create.renderCall) throw new Error("Missing create renderer");
+		const component = create.renderCall(
+			{ task: "continue review", from: "old-worker", name: "new-worker", mode: "background" } as never,
+			theme,
+			{ expanded: false } as never,
 		);
-		const create = tools.find((tool) => tool.name === "subagent_create");
-		if (!create) throw new Error("Missing subagent_create tool");
-
-		const args = {
-			name: "worker",
-			context: "context one\ncontext two",
-			task: "task one\ntask two",
-		};
-		const collapsed = renderToolCall(create, args, false);
-		expect(collapsed.render(80)).toEqual(["subagent_create worker", "context one", "context two", "…"]);
-
-		const expanded = renderToolCall(create, args, true, collapsed);
-		expect(expanded).toBe(collapsed);
-		expect(expanded.render(80)).toEqual([
-			"subagent_create worker",
-			"context one",
-			"context two",
-			"",
-			"task one",
-			"task two",
+		expect(component.render(100)).toEqual([
+			"subagent_create new-worker ← old-worker - background",
+			"continue review",
 		]);
+
+		if (!create.renderResult) throw new Error("Missing create result renderer");
+		const state: Record<string, unknown> = {};
+		const invalidate = vi.fn();
+		create.renderResult(
+			{
+				content: [{ type: "text", text: "running" }],
+				details: {
+					action: "create",
+					mode: "background",
+					childId: "id",
+					acceptedAt: 1,
+					snapshot: {
+						id: "id",
+						name: "resolved-worker",
+						from: "old-worker",
+						state: "running",
+						model: "anthropic/claude",
+						thinking_level: "high",
+						cwd: "/repo/resolved",
+						timeout_seconds: 60,
+						elapsed_ms: 1,
+						idle_ms: 0,
+						turns: 0,
+						usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, cost: 0 },
+					},
+				},
+			} as never,
+			{ expanded: false, isPartial: true },
+			theme,
+			{ state, invalidate } as never,
+		);
+		const updated = create.renderCall(
+			{ task: "continue review", from: "old-worker", mode: "background" } as never,
+			theme,
+			{ expanded: false, state } as never,
+		);
+		expect(updated.render(120)[0]).toBe("subagent_create resolved-worker ← old-worker - background timeout 60s");
+		expect(updated.render(120).at(-1)).toBe("resolved anthropic/claude high");
+		expect(invalidate).not.toHaveBeenCalled();
+		await Promise.resolve();
+		expect(invalidate).toHaveBeenCalledOnce();
 	});
 
-	test("renders the full send message when expanded", () => {
-		const { tools } = captureExtension();
-		const send = tools.find((tool) => tool.name === "subagent_send");
-		if (!send) throw new Error("Missing subagent_send tool");
+	test("renders wait selection, any/all, and timeout", () => {
+		const wait = capture().tools.find((tool) => tool.name === "subagent_wait");
+		if (!wait?.renderCall) throw new Error("Missing wait renderer");
+		const component = wait.renderCall(
+			{ names: ["a", "b"], for: "any", timeout_seconds: 30 } as never,
+			theme,
+			{} as never,
+		);
+		expect(component.render(100)).toEqual(["subagent_wait any"]);
+	});
 
-		const message = "message one\nmessage two\nmessage three\nmessage four";
-		const collapsed = renderToolCall(send, { name: "worker", message }, false);
-		expect(collapsed.render(80)).toEqual(["subagent_send worker", "message one", "message two", "message three…"]);
-
-		const expanded = renderToolCall(send, { name: "worker", message }, true, collapsed);
-		expect(expanded.render(80)).toEqual([
-			"subagent_send worker",
-			"message one",
-			"message two",
-			"message three",
-			"message four",
-		]);
+	test("registers the expandable notification renderer", () => {
+		const renderer = capture().renderers.get(NOTIFICATION_MESSAGE_TYPE);
+		if (!renderer) throw new Error("Missing notification renderer");
+		const collapsed = renderer(
+			{ role: "custom", customType: NOTIFICATION_MESSAGE_TYPE, content: "worker stopped", display: true, timestamp: 1 },
+			{ expanded: false },
+			theme,
+		);
+		expect(collapsed?.render(80)).toEqual(["╭─ Subagent update", "│ worker stopped", "╰─"]);
 	});
 });

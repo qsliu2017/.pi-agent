@@ -1,15 +1,19 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { describe, expect, test } from "vitest";
-import { stripAnsi } from "../../../src/utils/ansi.ts";
+import { describe, expect, test, vi } from "vitest";
 import {
-	renderStaticSubagentCall,
-	renderStaticSubagentResult,
-	renderSubagentNotificationCard,
-	SubagentDashboard,
-	selectDashboardChildren,
-} from "./render.ts";
-import type { DashboardChildView, SubagentSnapshot, TurnView } from "./types.ts";
+	CreateCardRegistry,
+	renderSubagentCreateCall,
+	renderSubagentCreateResult,
+	renderSubagentListCall,
+	renderSubagentListResult,
+	renderSubagentStopCall,
+	renderSubagentStopResult,
+	renderSubagentWaitCall,
+	renderSubagentWaitResult,
+} from "./cards.ts";
+import { renderSubagentNotificationCard, SubagentDashboard, selectDashboardChildren } from "./render.ts";
+import type { DashboardChildView, SubagentSnapshot } from "./types.ts";
 
 const theme = {
 	fg: (_color: string, text: string) => text,
@@ -18,286 +22,241 @@ const theme = {
 
 function snapshot(overrides: Partial<SubagentSnapshot> = {}): SubagentSnapshot {
 	return {
-		id: "child-1",
+		id: "child",
 		name: "worker",
 		state: "running",
-		model: "test/test-model",
+		model: "test/model",
 		thinking_level: "off",
-		elapsed_ms: 0,
-		idle_ms: 0,
+		cwd: "/repo",
+		elapsed_ms: 1_000,
+		idle_ms: 100,
 		turns: 1,
-		usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, cost: 0 },
+		usage: { input: 10, output: 5, cache_read: 0, cache_write: 0, cost: 0 },
 		...overrides,
 	};
 }
 
-function view(
-	overrides: Omit<Partial<DashboardChildView>, "snapshot"> & { snapshot?: Partial<SubagentSnapshot> } = {},
-): DashboardChildView {
+function view(overrides: Partial<DashboardChildView> = {}): DashboardChildView {
 	return {
-		snapshot: snapshot(overrides.snapshot),
-		turns: overrides.turns ?? [],
-		dashboardOrder: overrides.dashboardOrder ?? 1,
-	};
-}
-
-function turn(index: number, overrides: Partial<TurnView> = {}): TurnView {
-	return {
-		index,
-		textPreview: `text-${index}`,
-		activities: [],
-		startedAt: index,
-		endedAt: index + 1,
+		snapshot: snapshot(),
+		turns: [],
+		dashboardOrder: 1,
 		...overrides,
 	};
 }
 
-function dashboard(children: DashboardChildView[], expanded: boolean, maxLines = 24): SubagentDashboard {
-	return new SubagentDashboard(
-		() => children,
-		() => expanded,
-		() => maxLines,
-		theme,
-	);
-}
-
-describe("SubagentDashboard", () => {
-	test("filters settled children and renders oldest activation first", () => {
-		const selected = selectDashboardChildren([
-			view({ snapshot: { id: "old", name: "old", state: "running" }, dashboardOrder: 10 }),
-			view({ snapshot: { id: "done", name: "done", state: "completed" }, dashboardOrder: 40 }),
-			view({ snapshot: { id: "new", name: "new", state: "waiting_parent" }, dashboardOrder: 30 }),
-			view({ snapshot: { id: "paused", name: "paused", state: "paused" }, dashboardOrder: 50 }),
-			view({ snapshot: { id: "middle", name: "middle", state: "stopping" }, dashboardOrder: 20 }),
+describe("dashboard", () => {
+	test("shows only running children in stable activation order", () => {
+		const children = selectDashboardChildren([
+			view({ snapshot: snapshot({ id: "stopped", state: "stopped" }), dashboardOrder: 1 }),
+			view({ snapshot: snapshot({ id: "b", name: "b" }), dashboardOrder: 3 }),
+			view({ snapshot: snapshot({ id: "a", name: "a" }), dashboardOrder: 2 }),
 		]);
-
-		expect(selected.map((child) => child.snapshot.id)).toEqual(["old", "middle", "new"]);
+		expect(children.map((child) => child.snapshot.id)).toEqual(["a", "b"]);
 	});
 
-	test("keeps create order stable across child activity events", () => {
-		const first = view({ snapshot: { id: "first", name: "first" }, dashboardOrder: 1 });
-		const second = view({ snapshot: { id: "second", name: "second" }, dashboardOrder: 2 });
-
-		second.snapshot.current_activity = { type: "tool", name: "bash", started_at: 100 };
-		first.snapshot.current_activity = { type: "thinking", started_at: 200 };
-		second.turns.push(turn(1, { endedAt: 300 }));
-
-		expect(selectDashboardChildren([second, first]).map((child) => child.snapshot.id)).toEqual(["first", "second"]);
-	});
-
-	test("collapsed mode renders one fixed single-line row per living child", () => {
-		const lines = dashboard(
-			[
-				view({
-					snapshot: {
-						name: "runner",
-						state: "running",
-						thinking_level: "high",
-						turns: 8,
-						current_activity: { type: "tool", name: "bash", preview: "cargo test\ncache" },
-					},
-					dashboardOrder: 1,
-				}),
-				view({
-					snapshot: { name: "waiting", state: "waiting_parent", turns: 3, pending_question: "Which API?" },
-					dashboardOrder: 2,
-				}),
-				view({ snapshot: { name: "done", state: "completed" }, dashboardOrder: 3 }),
-			],
-			false,
-		).render(120);
-
-		expect(lines).toHaveLength(3);
+	test("renders a bounded width-safe live widget", () => {
+		const dashboard = new SubagentDashboard(
+			() => [view({ snapshot: snapshot({ name: "long-worker-name", current_activity: { type: "tool", name: "bash", preview: "very long command" } }) })],
+			() => false,
+			() => 5,
+			theme,
+		);
+		const lines = dashboard.render(24);
 		expect(lines[0]).toBe("Subagents");
-		expect(lines[1]).toContain("● runner  test-model:high  turn 8  $ cargo test cache");
-		expect(lines[2]).toContain("? waiting  test-model  turn 3  waiting for parent");
-		expect(lines.join("\n")).not.toContain("done");
-	});
-
-	test("expanded mode renders available details for only the latest five turns", () => {
-		const turns = Array.from({ length: 6 }, (_, index) => turn(index + 1));
-		turns[5] = turn(6, {
-			thinkingPreview: "inspect the file",
-			textPreview: "The implementation is safe.",
-			activities: [
-				{
-					toolCallId: "tool-1",
-					name: "read",
-					preview: "src/index.ts",
-					resultPreview: "export const value = 1;",
-					startedAt: 1,
-					endedAt: 2,
-				},
-			],
-		});
-		const output = dashboard(
-			[
-				view({
-					snapshot: { elapsed_ms: 119_600, idle_ms: 2_000, turns: 6 },
-					turns,
-				}),
-			],
-			true,
-		).render(120);
-		const text = output.join("\n");
-
-		expect(text).not.toContain("text-1");
-		for (let index = 2; index <= 5; index++) expect(text).toContain(`text-${index}`);
-		expect(text).toContain("thinking: inspect the file");
-		expect(text).toContain("text: The implementation is safe.");
-		expect(text).toContain("tool: read src/index.ts");
-		expect(text).toContain("result: export const value = 1;");
-		expect(text).toContain("2m0s");
-		expect(text).not.toContain("1m60s");
-	});
-
-	test("truncates every row instead of wrapping and respects the width", () => {
-		const lines = dashboard(
-			[
-				view({
-					snapshot: {
-						name: "worker-with-a-very-long-name",
-						current_activity: { type: "thinking", preview: "x".repeat(200) },
-					},
-				}),
-			],
-			false,
-		).render(24);
-
-		expect(lines).toHaveLength(2);
 		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(24);
 	});
-
-	test("bounds dashboard height and reports omitted children", () => {
-		const children = Array.from({ length: 4 }, (_, index) =>
-			view({ snapshot: { id: String(index), name: `worker-${index}` }, dashboardOrder: index + 1 }),
-		);
-		const lines = dashboard(children, false, 4).render(120);
-
-		expect(lines).toHaveLength(4);
-		expect(lines.at(-1)).toContain("2 more lines (2 subagents omitted)");
-	});
-
-	test("follows the global expansion state without transcript render state", () => {
-		let expanded = false;
-		const component = new SubagentDashboard(
-			() => [view({ turns: [turn(1)] })],
-			() => expanded,
-			() => 24,
-			theme,
-		);
-		expect(component.render(120)).toHaveLength(2);
-		expanded = true;
-		expect(component.render(120).join("\n")).toContain("text: text-1");
-	});
 });
 
-describe("subagent notification card", () => {
-	test("renders zero transcript lines while collapsed and all multiline content while expanded", () => {
-		const content =
-			"[subagent worker] state=waiting_parent\nNeed approval for the migration.\n\nAttempted:\n- dry run\n- validation";
-		const component = renderSubagentNotificationCard(content, theme, false);
-		expect(component.render(80)).toEqual([]);
-
-		const expanded = renderSubagentNotificationCard(content, theme, true, component);
-		expect(expanded).toBe(component);
-		const text = expanded.render(80).map(stripAnsi).join("\n");
-		expect(text).toContain("Subagent update");
-		expect(text).toContain(
-			"[subagent worker] state=waiting_parent\n│ Need approval for the migration.\n│ \n│ Attempted:\n│ - dry run\n│ - validation",
+describe("tool cards", () => {
+	test("updates a finalized background create card when its child later stops", () => {
+		const registry = new CreateCardRegistry();
+		const invalidate = vi.fn();
+		const running = snapshot({ id: "id", state: "running" });
+		const details = registry.bind(
+			{ action: "create", mode: "background", childId: "id", acceptedAt: 1, snapshot: running },
+			invalidate,
 		);
+		expect(details.snapshot.state).toBe("running");
+		registry.update([snapshot({ id: "id", state: "stopped", stop_reason: "finished", final_response: "done" })]);
+		expect(invalidate).toHaveBeenCalledOnce();
+		const rebound = registry.bind(details, invalidate);
+		expect(rebound.snapshot.state).toBe("stopped");
+		expect(rebound.snapshot.final_response).toBe("done");
 	});
 
-	test("wraps complete content safely at narrow widths without truncating the handoff", () => {
-		const content = "alpha beta gamma\nlong-token-123456789";
-		const lines = renderSubagentNotificationCard(content, theme, true).render(8);
-		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(8);
-		const body = lines
-			.slice(1, -1)
-			.map((line) => stripAnsi(line).replace(/^│ ?/, ""))
-			.join("");
-		expect(body.replace(/\s/g, "")).toBe(content.replace(/\s/g, ""));
-		expect(lines.join("\n")).not.toContain("…");
-	});
+	const createInput = {
+		name: "worker",
+		mode: "wait" as const,
+		task: "one\ntwo\nthree\nfour\nfive\nsix",
+		cwd: "/repo",
+		model: "test/model",
+		thinkingLevel: "low" as const,
+		timeoutSeconds: 30,
+	};
 
-	test("keeps ANSI-styled lines width-safe and toggles repeatedly through the reused component", () => {
-		const ansiTheme = {
-			fg: (_color: string, text: string) => `\u001b[35m${text}\u001b[0m`,
-			bold: (text: string) => `\u001b[1m${text}\u001b[22m`,
-		} as unknown as Theme;
-		const content = "first notification line\nsecond line";
-		const component = renderSubagentNotificationCard(content, ansiTheme, false);
-		expect(component.render(11)).toEqual([]);
-		renderSubagentNotificationCard(content, ansiTheme, true, component);
-		const expanded = component.render(11);
-		for (const line of expanded) expect(visibleWidth(line)).toBeLessThanOrEqual(11);
-		const expandedBody = expanded
-			.slice(1, -1)
-			.map((line) => stripAnsi(line).replace(/^│ ?/, ""))
-			.join("")
-			.replace(/\s/g, "");
-		expect(expandedBody).toContain("firstnotificationline");
-		renderSubagentNotificationCard(content, ansiTheme, false, component);
-		expect(component.render(11)).toEqual([]);
-		renderSubagentNotificationCard(content, ansiTheme, true, component);
-		expect(stripAnsi(component.render(40).join("\n"))).toContain("second line");
-	});
-});
-
-describe("static subagent tool rendering", () => {
-	test("keeps the header separate and collapses the prompt body to three rendered lines", () => {
-		const component = renderStaticSubagentCall(
-			"create",
-			"worker",
-			"line one\nline two\nline three\nline four",
+	test("renders the create card with bounded prompt sections and footer", () => {
+		const lines = renderSubagentCreateCall(
+			{ ...createInput, from: "source", systemPrompt: "role one\nrole two\nrole three\nrole four" },
 			theme,
+			false,
+		).render(100);
+		expect(lines).toEqual([
+			"subagent_create worker ← source - wait timeout 30s",
+			"role one",
+			"role two",
+			"role three…",
+			"one",
+			"two",
+			"three",
+			"four",
+			"five…",
+			"/repo test/model low",
+		]);
+	});
+
+	test("renders reactive create status and expanded handoff", () => {
+		const running = renderSubagentCreateResult(
+			{ action: "create", mode: "background", childId: "id", acceptedAt: 1, snapshot: snapshot() },
+			theme,
+			false,
+			true,
 		);
-		const lines = component.render(80);
-
-		expect(lines).toEqual(["subagent_create worker", "line one", "line two", "line three…"]);
-		expect(lines.slice(1)).toHaveLength(3);
-		expect(lines.join("\n")).not.toContain("line four");
-	});
-
-	test("wraps prompt lines safely to width and marks collapsed wrapping truncation", () => {
-		const lines = renderStaticSubagentCall(
-			"send",
-			"worker-with-a-long-name",
-			"first line\nsecond line contains several words\nthird-line-is-a-very-long-token",
-			theme,
-		).render(12);
-
-		expect(stripAnsi(lines[0] ?? "")).toBe("subagent_...");
-		expect(lines.slice(1).map(stripAnsi)).toEqual(["first line", "second line", "contains…"]);
-		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(12);
-	});
-
-	test("shows the full multiline prompt when expanded and reuses the component while toggling", () => {
-		const content = "line one\nline two\nline three\nline four";
-		const collapsed = renderStaticSubagentCall("send", "worker", content, theme);
-		const expanded = renderStaticSubagentCall("send", "worker", content, theme, true, collapsed);
-
-		expect(expanded).toBe(collapsed);
-		expect(expanded.render(80)).toEqual(["subagent_send worker", "line one", "line two", "line three", "line four"]);
-
-		const collapsedAgain = renderStaticSubagentCall("send", "worker", content, theme, false, expanded);
-		expect(collapsedAgain).toBe(collapsed);
-		expect(collapsedAgain.render(80)).toEqual(["subagent_send worker", "line one", "line two", "line three…"]);
-	});
-
-	test("renders a static acknowledgement from tool result details", () => {
-		const component = renderStaticSubagentResult(
+		expect(running.render(80)).toEqual(["id running"]);
+		const stopped = renderSubagentCreateResult(
 			{
 				action: "create",
-				childId: "child-1",
+				mode: "wait",
+				childId: "id",
 				acceptedAt: 1,
-				snapshot: snapshot({ name: "worker", state: "running" }),
+				snapshot: snapshot({ state: "stopped", final_response: "complete handoff", stop_reason: "finished" }),
 			},
 			theme,
+			true,
+			false,
 		);
+		expect(stopped.render(80)).toEqual(["id stopped", "complete handoff"]);
+	});
 
-		expect(component.render(120)).toEqual(["Created worker (child-1) · running"]);
-		expect(component.render(24)).toHaveLength(1);
-		expect(visibleWidth(component.render(24)[0] ?? "")).toBeLessThanOrEqual(24);
+	test("renders informative any/all wait lifecycle cards", () => {
+		const pending = {
+			reason: "pending" as const,
+			started_at: 1,
+			elapsed_ms: 5_000,
+			waitFor: "all" as const,
+			snapshots: [
+				snapshot({ id: "a", name: "a", state: "stopped", elapsed_ms: 30_000, stopped_at: 10_001 }),
+				snapshot({ id: "b", name: "b", state: "running" }),
+				snapshot({ id: "c", name: "c", state: "stopped", elapsed_ms: 35_000, stopped_at: 15_001 }),
+			],
+			settled: 2,
+			total: 3,
+		};
+		expect(renderSubagentWaitCall({ names: ["a", "b", "c"], waitFor: "all", timeoutSeconds: 20, details: pending }, theme).render(100)).toEqual([
+			"subagent_wait all",
+		]);
+		expect(renderSubagentWaitResult(pending, 20, theme, false).render(100)).toEqual([
+			"a done after 10s",
+			"b running",
+			"c done after 15s",
+			"timeout 20s",
+		]);
+
+		const settled = {
+			...pending,
+			reason: "settled" as const,
+			elapsed_ms: 19_000,
+			snapshots: pending.snapshots.map((item) =>
+				item.id === "b" ? snapshot({ id: "b", name: "b", state: "stopped", elapsed_ms: 39_000, stopped_at: 19_001 }) : item,
+			),
+			settled: 3,
+		};
+		expect(renderSubagentWaitCall({ names: ["a", "b", "c"], waitFor: "all", timeoutSeconds: 20, details: settled }, theme).render(100)).toEqual([
+			"subagent_wait all done after 19s",
+		]);
+		expect(renderSubagentWaitResult(settled, 20, theme, false).render(100)).toEqual([
+			"a done after 10s",
+			"b done after 19s",
+			"c done after 15s",
+		]);
+		const anySettled = {
+			...pending,
+			reason: "settled" as const,
+			waitFor: "any" as const,
+			elapsed_ms: 10_000,
+			snapshots: [
+				snapshot({ id: "a", name: "a", state: "running" }),
+				snapshot({ id: "b", name: "b", state: "stopped", elapsed_ms: 30_000, stopped_at: 10_001 }),
+				snapshot({ id: "c", name: "c", state: "running" }),
+			],
+			settled: 1,
+			matched: snapshot({ id: "b", name: "b", state: "stopped", elapsed_ms: 30_000, stopped_at: 10_001 }),
+		};
+		expect(renderSubagentWaitCall({ names: ["a", "b", "c"], waitFor: "any", timeoutSeconds: 20, details: anySettled }, theme).render(100)).toEqual([
+			"subagent_wait any done after 10s",
+		]);
+		expect(renderSubagentWaitResult(anySettled, 20, theme, false).render(100)).toEqual([
+			"a",
+			"b done after 10s",
+			"c",
+		]);
+
+		const timedOut = { ...pending, reason: "timeout" as const, elapsed_ms: 20_000 };
+		expect(renderSubagentWaitCall({ names: ["a", "b", "c"], waitFor: "all", timeoutSeconds: 20, details: timedOut }, theme).render(100)).toEqual([
+			"subagent_wait all timeout after 20s",
+		]);
+		expect(renderSubagentWaitResult(timedOut, 20, theme, false).render(100)).toEqual([
+			"a done after 10s",
+			"b",
+			"c done after 15s",
+		]);
+		expect(renderSubagentWaitCall({ names: ["a"], waitFor: "any", timeoutSeconds: 20 }, theme).render(100)).toEqual([
+			"subagent_wait",
+		]);
+	});
+
+	test("keeps every card line within the available width", () => {
+		const cards = [
+			renderSubagentCreateCall({ ...createInput, systemPrompt: "a very long system prompt", task: "a very long task" }, theme, false),
+			renderSubagentWaitCall({ names: ["a-very-long-child-name"], waitFor: "all", timeoutSeconds: 30 }, theme),
+			renderSubagentListCall({ states: ["running", "stopped"], detail: "standard" }, theme),
+			renderSubagentStopCall({ name: "a-very-long-child-name", reason: "a long reason" }, theme, false),
+		];
+		for (const card of cards) {
+			for (const line of card.render(18)) expect(visibleWidth(line)).toBeLessThanOrEqual(18);
+		}
+	});
+
+	test("renders list and stop cards", () => {
+		expect(renderSubagentListCall({ states: ["running"], detail: "standard" }, theme).render(100)).toEqual([
+			"subagent_list running - standard",
+		]);
+		expect(
+			renderSubagentListResult({ snapshots: [snapshot({ id: "id", name: "worker" })] }, "compact", theme, false).render(100),
+		).toEqual(["worker id running turn 1"]);
+		expect(renderSubagentStopCall({ name: "worker", reason: "because" }, theme, false).render(100)).toEqual([
+			"subagent_stop worker",
+			"because",
+		]);
+		expect(
+			renderSubagentStopResult({ childId: "id", snapshot: snapshot({ state: "stopped" }) }, theme, false).render(100),
+		).toEqual(["id stopped"]);
+	});
+});
+
+describe("notifications", () => {
+	test("shows an identity and preview when collapsed and wraps the expanded handoff", () => {
+		const content = "[subagent worker (id)] state=stopped\nfinal handoff with details";
+		const collapsed = renderSubagentNotificationCard(content, theme, false);
+		expect(collapsed.render(40)).toEqual([
+			"╭─ Subagent update",
+			"│ worker id stopped",
+			"│ final handoff with details",
+			"╰─",
+		]);
+		const expanded = renderSubagentNotificationCard(content, theme, true, collapsed);
+		const lines = expanded.render(14);
+		expect(lines[0]).toContain("Subagent");
+		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(14);
 	});
 });
