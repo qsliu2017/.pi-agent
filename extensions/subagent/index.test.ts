@@ -188,7 +188,7 @@ describe("descriptions and rendering", () => {
 		if (!renderer) throw new Error("Missing notification renderer");
 		const collapsed = renderer(
 			{ role: "custom", customType: NOTIFICATION_MESSAGE_TYPE, content: "worker stopped", display: true, timestamp: 1 },
-			{ expanded: false },
+			{ expanded: false, outputPad: 0 },
 			theme,
 		);
 		expect(collapsed?.render(80)).toEqual(["╭─ Subagent update", "│ worker stopped", "╰─"]);

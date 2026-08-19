@@ -1,0 +1,46 @@
+{
+  "name": "@qsliu/pi-subagent",
+  "version": "0.1.0",
+  "description": "Run isolated subagents as in-process Pi SDK sessions.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "subagent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qsliu2017/.pi-agent.git",
+    "directory": "extensions/subagent"
+  },
+  "homepage": "https://github.com/qsliu2017/.pi-agent/blob/main/extensions/subagent",
+  "files": [
+    "index.ts",
+    "cards.ts",
+    "render.ts",
+    "schemas.ts",
+    "supervisor.ts",
+    "types.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "vitest run"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2",
+    "vitest": "^3.2.4"
+  }
+}
