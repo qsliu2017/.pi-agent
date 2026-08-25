@@ -41,6 +41,7 @@ function view(overrides: Partial<DashboardChildView> = {}): DashboardChildView {
 		snapshot: snapshot(),
 		turns: [],
 		dashboardOrder: 1,
+		parentId: null,
 		...overrides,
 	};
 }
@@ -53,6 +54,25 @@ describe("dashboard", () => {
 			view({ snapshot: snapshot({ id: "a", name: "a" }), dashboardOrder: 2 }),
 		]);
 		expect(children.map((child) => child.snapshot.id)).toEqual(["a", "b"]);
+	});
+
+	test("renders recursive children as a tree", () => {
+		const dashboard = new SubagentDashboard(
+			() => [
+				view({ snapshot: snapshot({ id: "parent", name: "parent" }), dashboardOrder: 1 }),
+				view({ snapshot: snapshot({ id: "first", name: "first" }), dashboardOrder: 2, parentId: "parent" }),
+				view({ snapshot: snapshot({ id: "second", name: "second" }), dashboardOrder: 3, parentId: "parent" }),
+			],
+			() => false,
+			() => 8,
+			theme,
+		);
+		expect(dashboard.render(100).map((line) => line.split(/\s{2}/)[0])).toEqual([
+			"Subagents",
+			"● parent",
+			"├─ ● first",
+			"└─ ● second",
+		]);
 	});
 
 	test("renders a bounded width-safe live widget", () => {

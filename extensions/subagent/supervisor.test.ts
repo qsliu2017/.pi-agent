@@ -369,25 +369,56 @@ describe("create lifecycle", () => {
 });
 
 describe("stop", () => {
-	test("aborts running work and reports stopped", async () => {
-		const { supervisor, internals } = createSupervisor();
-		const record = addRecord(internals, metadata({ state: "running" }));
+	function installAbortableRun(record: TestRecord): ReturnType<typeof vi.fn> {
 		let resolveRun = () => {};
 		record.runPromise = new Promise<void>((resolve) => {
 			resolveRun = resolve;
+		});
+		const abort = vi.fn(() => {
+			record.metadata.state = "stopped";
+			resolveRun();
 		});
 		record.session = {
 			clearQueue: vi.fn(),
 			abortRetry: vi.fn(),
 			abortCompaction: vi.fn(),
-			agent: {
-				abort: vi.fn(() => {
-					record.metadata.state = "stopped";
-					resolveRun();
-				}),
-			},
+			agent: { abort },
 		} as unknown as AgentSession;
+		return abort;
+	}
+
+	test("aborts running work and reports stopped", async () => {
+		const { supervisor, internals } = createSupervisor();
+		const record = addRecord(internals, metadata({ state: "running" }));
+		installAbortableRun(record);
 		const result = await supervisor.stopSubagent(ROOT_CALLER_ID, { name: record.metadata.id });
 		expect(result.details.snapshot.state).toBe("stopped");
+	});
+
+	test("recursively aborts active descendants without forwarding their results", async () => {
+		const { supervisor, internals, sent } = createSupervisor();
+		const parent = addRecord(internals, metadata({ id: "parent", name: "parent", state: "running" }));
+		const child = addRecord(
+			internals,
+			metadata({ id: "child", name: "child", parentId: "parent", depth: 2, state: "running", notifyOnStop: true }),
+		);
+		const grandchild = addRecord(
+			internals,
+			metadata({ id: "grandchild", name: "grandchild", parentId: "child", depth: 3, state: "running", notifyOnStop: true }),
+		);
+		const aborts = [parent, child, grandchild].map(installAbortableRun);
+
+		const result = await supervisor.stopSubagent(ROOT_CALLER_ID, { name: "parent", reason: "no longer needed" });
+
+		expect(aborts.every((abort) => abort.mock.calls.length === 1)).toBe(true);
+		expect([parent, child, grandchild].map((record) => record.metadata.state)).toEqual([
+			"stopped",
+			"stopped",
+			"stopped",
+		]);
+		expect(child.metadata.stopMessage).toContain("Stopped with ancestor parent");
+		expect(grandchild.metadata.notifyOnStop).toBe(false);
+		expect(result.content[0]?.text).toContain("2 active descendants");
+		expect(sent).toEqual([]);
 	});
 });

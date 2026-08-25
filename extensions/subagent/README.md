@@ -99,7 +99,7 @@ subagent_stop({
 })
 ```
 
-Abort an active run, retain its durable history, and mark it `stopped`. The same child ID never runs again; create from it to continue the work.
+Abort an active run and every active descendant, retain their durable histories, and mark them `stopped`. Descendant cancellations are consumed by the stop operation rather than forwarded past the stopped ancestor. The same child ID never runs again; create from it to continue the work.
 
 ### Subagent States
 
@@ -130,11 +130,13 @@ The TUI has two surfaces: a live widget for active work and transcript cards for
 ```text
 Subagents
 ● api-review  claude-sonnet low  turn 3  read src/server.ts
-● test-runner gpt-5.4 minimal   turn 1  $ bun test
+├─ ● schema-review  claude-haiku low  turn 1  read src/schema.ts
+└─ ● route-review   gpt-5.4 minimal  turn 1  read src/routes.ts
+● test-runner  gpt-5.4 minimal  turn 1  $ bun test
 ```
 
-- The widget shows only `running` children in creation order and disappears when none remain.
-- Collapsed mode uses one line per child: status, name, model and thinking level, turn count, and current activity.
+- The widget shows only `running` children, groups recursive descendants beneath their active parent with tree connectors, preserves sibling creation order, and disappears when none remain.
+- Collapsed mode uses one line per child: hierarchy, status, name, model and thinking level, turn count, and current activity.
 - Expanded mode shows the latest five turns with thinking, text, tool calls, results, errors, token usage, elapsed time, and idle time.
 - Its height is capped at 40% of the terminal, between 4 and 24 lines. When space is limited, the final line reports omitted lines or children.
 - Live events update only the widget and are throttled to avoid excessive redraws. Routine child streams never become parent chat messages.

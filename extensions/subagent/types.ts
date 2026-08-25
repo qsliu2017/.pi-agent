@@ -125,6 +125,7 @@ export interface DashboardChildView {
 	snapshot: SubagentSnapshot;
 	turns: TurnView[];
 	dashboardOrder: number;
+	parentId: string | null;
 }
 
 export interface ListSubagentsDetails {

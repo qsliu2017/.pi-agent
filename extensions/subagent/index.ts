@@ -233,8 +233,8 @@ export default function SubagentExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "subagent_stop",
 		label: "Subagent Stop",
-		description: "Abort an active subagent and retain its durable history for a new continuation.",
-		promptSnippet: "Stop active work while retaining history",
+		description: "Recursively abort an active subagent and its active descendants while retaining durable history.",
+		promptSnippet: "Recursively stop active work while retaining history",
 		parameters: SubagentStopParams,
 		execute: async (_id, params, signal, onUpdate) =>
 			requireSupervisor().stopSubagent(ROOT_CALLER_ID, params, signal, onUpdate),

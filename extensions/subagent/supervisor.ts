@@ -430,6 +430,7 @@ export class SubagentSupervisor {
 			snapshot: this.snapshot(record),
 			turns: this.cloneTurns(record.turns),
 			dashboardOrder: record.metadata.dashboardOrder,
+			parentId: record.metadata.parentId,
 		}));
 	}
 
@@ -656,35 +657,50 @@ export class SubagentSupervisor {
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<StopSubagentDetails>,
 	): Promise<{ content: Array<{ type: "text"; text: string }>; details: StopSubagentDetails }> {
-		const record = await this.operationLock.run(() => {
+		const { record, active } = await this.operationLock.run(() => {
 			this.assertAccepting();
 			this.throwIfAborted(signal);
-			return this.resolveOne(callerId, params.name);
+			const target = this.resolveOne(callerId, params.name);
+			const subtree = [target, ...this.descendantsOf(target.metadata.id)];
+			const running = subtree.filter((child) => child.metadata.state === "running");
+			for (const child of running) {
+				child.claimed = true;
+				child.metadata.notifyOnStop = false;
+				this.claimNotification(child);
+				child.metadata.stopMessage =
+					child === target
+						? params.reason
+						: `Stopped with ancestor ${target.metadata.name} (${target.metadata.id})${params.reason ? `: ${params.reason}` : ""}`;
+				this.cancelRun(child, "requested");
+			}
+			this.persistRegistry();
+			return { record: target, active: running };
 		});
-		if (record.metadata.state === "running") {
+		const descendantCount = active.filter((child) => child !== record).length;
+		if (active.length > 0) {
 			onUpdate?.({
-				content: [{ type: "text", text: `Stopping ${record.metadata.name} (${record.metadata.id})…` }],
+				content: [
+					{
+						type: "text",
+						text: `Stopping ${record.metadata.name} (${record.metadata.id})${descendantCount > 0 ? ` and ${descendantCount} active descendant${descendantCount === 1 ? "" : "s"}` : ""}…`,
+					},
+				],
 				details: { childId: record.metadata.id, snapshot: this.snapshot(record) },
 			});
-			record.claimed = true;
-			record.metadata.notifyOnStop = false;
-			await record.lock.run(() => {
-				if (record.metadata.state !== "running") return;
-				record.metadata.stopMessage = params.reason;
-				this.cancelRun(record, "requested");
-			});
 			try {
-				if (record.runPromise) await this.waitForRun(record, signal);
-			} catch (error) {
-				if (record.metadata.state === "running") record.metadata.notifyOnStop = true;
-				throw error;
+				await Promise.all(active.map((child) => this.waitForRun(child, signal)));
 			} finally {
-				record.claimed = false;
+				for (const child of active) child.claimed = false;
 			}
 		}
 		const snapshot = this.snapshot(record);
 		return {
-			content: [{ type: "text", text: `Stopped ${record.metadata.name} (${record.metadata.id}).` }],
+			content: [
+				{
+					type: "text",
+					text: `Stopped ${record.metadata.name} (${record.metadata.id})${descendantCount > 0 ? ` and ${descendantCount} active descendant${descendantCount === 1 ? "" : "s"}` : ""}.`,
+				},
+			],
 			details: { childId: record.metadata.id, snapshot },
 		};
 	}
@@ -819,7 +835,7 @@ export class SubagentSupervisor {
 			defineTool({
 				name: "subagent_stop",
 				label: "Subagent Stop",
-				description: "Stop an active descendant and retain its history for a continuation.",
+				description: "Recursively stop an active descendant and its active subtree, retaining durable history.",
 				parameters: SubagentStopParams,
 				execute: async (_id, params: SubagentStopInput, signal, onUpdate) =>
 					this.stopSubagent(callerId, params, signal, onUpdate),
@@ -1374,6 +1390,20 @@ ${input.rolePrompt?.trim() || "Act as a focused implementation and research work
 			}
 			return false;
 		});
+	}
+
+	private descendantsOf(parentId: string): ChildRecord[] {
+		const descendants: ChildRecord[] = [];
+		const pending = [parentId];
+		while (pending.length > 0) {
+			const current = pending.shift();
+			for (const record of this.children.values()) {
+				if (record.metadata.parentId !== current) continue;
+				descendants.push(record);
+				pending.push(record.metadata.id);
+			}
+		}
+		return descendants;
 	}
 
 	private resolveOne(callerId: string, selector: string): ChildRecord {

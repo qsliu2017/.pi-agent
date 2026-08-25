@@ -65,38 +65,71 @@ function stateAppearance(_snapshot: SubagentSnapshot): { color: "warning"; symbo
 	return { color: "warning", symbol: "●" };
 }
 
-function childHeader(view: DashboardChildView, theme: Theme): string {
-	const { snapshot, turns } = view;
-	const appearance = stateAppearance(snapshot);
-	return `${theme.fg(appearance.color, appearance.symbol)} ${theme.fg("toolTitle", theme.bold(snapshot.name))}  ${theme.fg("muted", modelText(snapshot))}  ${theme.fg("dim", `turn ${snapshot.turns}`)}  ${theme.fg("toolOutput", collapsedActivity(snapshot, turns))}`;
+interface DashboardTreeRow {
+	view: DashboardChildView;
+	prefix: string;
 }
 
-function expandedChildLines(view: DashboardChildView, theme: Theme): string[] {
-	const lines = [childHeader(view, theme)];
+function childHeader(view: DashboardChildView, theme: Theme, prefix = ""): string {
+	const { snapshot, turns } = view;
+	const appearance = stateAppearance(snapshot);
+	return `${theme.fg("dim", prefix)}${theme.fg(appearance.color, appearance.symbol)} ${theme.fg("toolTitle", theme.bold(snapshot.name))}  ${theme.fg("muted", modelText(snapshot))}  ${theme.fg("dim", `turn ${snapshot.turns}`)}  ${theme.fg("toolOutput", collapsedActivity(snapshot, turns))}`;
+}
+
+function expandedChildLines(row: DashboardTreeRow, theme: Theme): string[] {
+	const { view, prefix } = row;
+	const detailIndent = " ".repeat(prefix.length);
+	const lines = [childHeader(view, theme, prefix)];
 	const turns = view.turns.slice(-EXPANDED_TURN_LIMIT);
 	for (const turn of turns) {
 		for (const [index, detail] of expandedTurnTexts(turn).entries()) {
-			const prefix = index === 0 ? `${String(turn.index).padStart(3)}  ` : "     ";
-			lines.push(theme.fg("toolOutput", `${prefix}${detail}`));
+			const turnPrefix = index === 0 ? `${String(turn.index).padStart(3)}  ` : "     ";
+			lines.push(theme.fg("toolOutput", `${detailIndent}${turnPrefix}${detail}`));
 		}
 	}
-	if (turns.length === 0) lines.push(theme.fg("dim", `     ${collapsedActivity(view.snapshot, view.turns)}`));
-	if (view.snapshot.error) lines.push(theme.fg("error", `     error: ${singleLine(view.snapshot.error)}`));
+	if (turns.length === 0) lines.push(theme.fg("dim", `${detailIndent}     ${collapsedActivity(view.snapshot, view.turns)}`));
+	if (view.snapshot.error) lines.push(theme.fg("error", `${detailIndent}     error: ${singleLine(view.snapshot.error)}`));
 	const usage = view.snapshot.usage;
 	const totalTokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 	lines.push(
 		theme.fg(
 			"dim",
-			`     ${formatTokens(totalTokens)} tokens | ${formatDuration(view.snapshot.elapsed_ms)} | idle ${formatDuration(view.snapshot.idle_ms)}`,
+			`${detailIndent}     ${formatTokens(totalTokens)} tokens | ${formatDuration(view.snapshot.elapsed_ms)} | idle ${formatDuration(view.snapshot.idle_ms)}`,
 		),
 	);
 	return lines;
 }
 
-export function selectDashboardChildren(children: DashboardChildView[]): DashboardChildView[] {
-	return children
+function dashboardTree(children: DashboardChildView[]): DashboardTreeRow[] {
+	const active = children
 		.filter((child) => LIVING_STATES.has(child.snapshot.state))
 		.sort((left, right) => left.dashboardOrder - right.dashboardOrder);
+	const activeIds = new Set(active.map((child) => child.snapshot.id));
+	const byParent = new Map<string, DashboardChildView[]>();
+	for (const child of active) {
+		if (!child.parentId || !activeIds.has(child.parentId)) continue;
+		byParent.set(child.parentId, [...(byParent.get(child.parentId) ?? []), child]);
+	}
+	const rows: DashboardTreeRow[] = [];
+	const visited = new Set<string>();
+	const visit = (view: DashboardChildView, ancestorLast: boolean[], prefix: string) => {
+		if (visited.has(view.snapshot.id)) return;
+		visited.add(view.snapshot.id);
+		rows.push({ view, prefix });
+		const descendants = byParent.get(view.snapshot.id) ?? [];
+		for (const [index, descendant] of descendants.entries()) {
+			const isLast = index === descendants.length - 1;
+			const ancestorPrefix = ancestorLast.map((last) => (last ? "   " : "│  ")).join("");
+			visit(descendant, [...ancestorLast, isLast], `${ancestorPrefix}${isLast ? "└─ " : "├─ "}`);
+		}
+	};
+	for (const root of active.filter((child) => !child.parentId || !activeIds.has(child.parentId))) visit(root, [], "");
+	for (const orphan of active) visit(orphan, [], "");
+	return rows;
+}
+
+export function selectDashboardChildren(children: DashboardChildView[]): DashboardChildView[] {
+	return dashboardTree(children).map((row) => row.view);
 }
 
 export class SubagentDashboard implements Component {
@@ -137,8 +170,8 @@ export class SubagentDashboard implements Component {
 		}
 
 		const availableWidth = Math.max(1, width);
-		const children = selectDashboardChildren(this.getChildren());
-		if (children.length === 0) {
+		const rows = dashboardTree(this.getChildren());
+		if (rows.length === 0) {
 			this.cachedWidth = width;
 			this.cachedExpanded = expanded;
 			this.cachedMaxLines = maxLines;
@@ -146,8 +179,8 @@ export class SubagentDashboard implements Component {
 			return this.cachedLines;
 		}
 
-		const sections = children.map((child) =>
-			expanded ? expandedChildLines(child, this.theme) : [childHeader(child, this.theme)],
+		const sections = rows.map((row) =>
+			expanded ? expandedChildLines(row, this.theme) : [childHeader(row.view, this.theme, row.prefix)],
 		);
 		const body = sections.flat();
 		let lines = [this.theme.fg("accent", this.theme.bold("Subagents")), ...body];
