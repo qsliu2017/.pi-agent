@@ -12,6 +12,7 @@ import type {
 
 const CREATE_SYSTEM_LINES = 3;
 const CREATE_TASK_LINES = 5;
+const CREATE_RESULT_LINES = 5;
 const STOP_REASON_LINES = 3;
 const COLLAPSED_LIST_ROWS = 5;
 
@@ -185,12 +186,12 @@ class CreateResultCard extends CachedCard {
 		const snapshot = this.details?.snapshot;
 		const status = snapshot?.state ?? (this.isError ? "error" : this.partial ? "running" : "stopped");
 		const lines = [statusLine(this.details?.childId, status, this.theme, width)];
-		if (!this.expanded || !snapshot || snapshot.state === "running") return lines;
+		if (!snapshot || snapshot.state === "running" || this.details?.mode === "background") return lines;
 		const handoff =
 			snapshot.stop_reason === "finished"
 				? snapshot.final_response
 				: snapshot.error ?? snapshot.final_response ?? snapshot.stop_message;
-		lines.push(...limitedText(handoff, width, undefined, this.theme));
+		lines.push(...limitedText(handoff, width, this.expanded ? undefined : CREATE_RESULT_LINES, this.theme));
 		return lines;
 	}
 }

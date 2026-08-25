@@ -192,6 +192,8 @@ export class SubagentDashboard implements Component {
 	}
 }
 
+const COLLAPSED_NOTIFICATION_LINES = 5;
+
 interface NotificationItem {
 	name?: string;
 	id?: string;
@@ -243,9 +245,10 @@ export class SubagentNotificationCard implements Component {
 			}
 			if (item.body) {
 				const wrapped = wrapTextWithAnsi(this.theme.fg("customMessageText", item.body), bodyWidth);
-				const visible = this.expanded ? wrapped : wrapped.slice(0, 1);
-				if (!this.expanded && wrapped.length > 1 && visible.length > 0) {
-					visible[0] = `${truncateToWidth(visible[0] ?? "", Math.max(1, bodyWidth - 1), "")}${this.theme.fg("dim", "…")}`;
+				const visible = this.expanded ? wrapped : wrapped.slice(0, COLLAPSED_NOTIFICATION_LINES);
+				if (!this.expanded && wrapped.length > visible.length && visible.length > 0) {
+					const last = visible.length - 1;
+					visible[last] = `${truncateToWidth(visible[last] ?? "", Math.max(1, bodyWidth - 1), "")}${this.theme.fg("dim", "…")}`;
 				}
 				body.push(...visible.map((line) => `${prefix}${line}`));
 			}

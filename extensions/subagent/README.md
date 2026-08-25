@@ -16,6 +16,7 @@ Run isolated subagents as in-process Pi SDK sessions. The extension keeps the pa
 - Allow explicit background work when the parent must react to one child while siblings continue.
 - Reuse a retained child's history for questions, corrections, and follow-up work.
 - Keep child transcripts out of the parent context; return only final handoffs, failures, and lifecycle notices.
+- Render every returned handoff where its message actually enters the parent transcript.
 - Configure model, thinking level, role, tools, cwd, context, and timeout per child.
 - Support bounded recursive delegation with descendant-only management scope.
 - Abort potentially stuck runs with an enforceable timeout.
@@ -122,7 +123,7 @@ Setup failure before durable acceptance returns a tool error and creates no chil
 
 ### TUI
 
-The TUI has two surfaces: a live widget for active work and transcript cards for individual tool calls.
+The TUI has two surfaces: a live widget for active work and transcript cards for tool calls and background completion messages. Transcript cards preserve the main session's true message order: a wait-mode handoff remains with its tool call, while a background handoff appears at the later point where its follow-up message enters the session.
 
 #### Active Subagents Widget
 
@@ -144,16 +145,22 @@ Each model-facing tool has a compact transcript card. Values in `{{braces}}` are
 
 **`subagent_create`**
 
-A typical background call looks like this:
+A typical completed wait call looks like this:
 
 ```text
-subagent_create reviewer - background timeout 60s
+subagent_create reviewer - wait timeout 60s
 Review the API boundary and report compatibility risks.
 packages/api anthropic/claude-sonnet high
-7dc8… running
+7dc8… stopped
+The boundary is compatible except for the renamed pagination field.
+Update clients before removing the legacy alias.
 ```
 
-The header includes the optional name, continuation source, mode, and run timeout. The body previews at most three system-prompt lines and five task lines. The configuration row is intentionally differential: cwd, model, and thinking effort appear only when they differ from the parent, and a differing cwd is relative to the parent's cwd. If nothing differs, that row is absent. The UUID status row remains live after a background create returns, changing to `stopped` when the child settles. Expanding the card reveals unabridged instructions, context, and the final handoff or error.
+The header includes the optional name, continuation source, mode, and run timeout. The prompt body previews at most three system-prompt lines and five task lines. The configuration row is intentionally differential: cwd, model, and thinking effort appear only when they differ from the parent, and a differing cwd is relative to the parent's cwd. If nothing differs, that row is absent.
+
+For `mode: "wait"`, the tool result is appended below the prompt in the same card; it never replaces the prompt. The collapsed card shows at most five wrapped lines of the final handoff or error, and the expanded card shows the complete result as well as unabridged instructions and context. Parallel wait calls remain in create order even when their children finish in a different order, matching Pi's tool-result message order.
+
+For `mode: "background"`, the create card shows the prompt and reactive UUID status only. Its status remains live after the tool call returns and changes from `running` to `stopped`, but the final handoff is not inserted retrospectively into this earlier card. The handoff is rendered later in its own notification card where the follow-up message actually enters the parent session.
 
 **`subagent_wait`**
 
@@ -199,15 +206,15 @@ subagent_stop {{name}}
 
 Expanding the card reveals the complete stop reason and retained final handoff or error.
 
-Background completions appear as expandable **Subagent update** cards:
+Background completions appear as separate expandable **Subagent update** cards:
 
 ```text
 Subagent update
 {{name}} {{uuid}} stopped
-{{final handoff or error; collapsed to a preview}}
+{{final handoff or error; at most 5 wrapped lines when collapsed}}
 ```
 
-When tool output is collapsed, the update keeps one handoff preview line; expanding it reveals the complete handoff or error.
+Each update card occupies the exact transcript position of the model-visible follow-up message; it does not modify or move the earlier `subagent_create` card. The collapsed card shows at most five wrapped lines of the handoff or error, and the expanded card shows all lines. If multiple completions are delivered in one batched follow-up, their updates retain the order in that message.
 
 ### Flags
 

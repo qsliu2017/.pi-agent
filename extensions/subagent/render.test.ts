@@ -115,7 +115,35 @@ describe("tool cards", () => {
 		]);
 	});
 
-	test("renders reactive create status and expanded handoff", () => {
+	test("renders wait handoffs below the prompt with five/all collapsed/expanded lines", () => {
+		const handoff = "one\ntwo\nthree\nfour\nfive\nsix";
+		const details = {
+			action: "create" as const,
+			mode: "wait" as const,
+			childId: "id",
+			acceptedAt: 1,
+			snapshot: snapshot({ state: "stopped", final_response: handoff, stop_reason: "finished" }),
+		};
+		expect(renderSubagentCreateResult(details, theme, false, false).render(80)).toEqual([
+			"id stopped",
+			"one",
+			"two",
+			"three",
+			"four",
+			"five…",
+		]);
+		expect(renderSubagentCreateResult(details, theme, true, false).render(80)).toEqual([
+			"id stopped",
+			"one",
+			"two",
+			"three",
+			"four",
+			"five",
+			"six",
+		]);
+	});
+
+	test("keeps background handoffs out of the create result card", () => {
 		const running = renderSubagentCreateResult(
 			{ action: "create", mode: "background", childId: "id", acceptedAt: 1, snapshot: snapshot() },
 			theme,
@@ -126,16 +154,16 @@ describe("tool cards", () => {
 		const stopped = renderSubagentCreateResult(
 			{
 				action: "create",
-				mode: "wait",
+				mode: "background",
 				childId: "id",
 				acceptedAt: 1,
-				snapshot: snapshot({ state: "stopped", final_response: "complete handoff", stop_reason: "finished" }),
+				snapshot: snapshot({ state: "stopped", final_response: "notification only", stop_reason: "finished" }),
 			},
 			theme,
 			true,
 			false,
 		);
-		expect(stopped.render(80)).toEqual(["id stopped", "complete handoff"]);
+		expect(stopped.render(80)).toEqual(["id stopped"]);
 	});
 
 	test("renders informative any/all wait lifecycle cards", () => {
@@ -245,18 +273,33 @@ describe("tool cards", () => {
 });
 
 describe("notifications", () => {
-	test("shows an identity and preview when collapsed and wraps the expanded handoff", () => {
-		const content = "[subagent worker (id)] state=stopped\nfinal handoff with details";
+	test("shows five/all handoff lines when collapsed/expanded", () => {
+		const content = "[subagent worker (id)] state=stopped\none\ntwo\nthree\nfour\nfive\nsix";
 		const collapsed = renderSubagentNotificationCard(content, theme, false);
 		expect(collapsed.render(40)).toEqual([
 			"╭─ Subagent update",
 			"│ worker id stopped",
-			"│ final handoff with details",
+			"│ one",
+			"│ two",
+			"│ three",
+			"│ four",
+			"│ five…",
 			"╰─",
 		]);
 		const expanded = renderSubagentNotificationCard(content, theme, true, collapsed);
-		const lines = expanded.render(14);
-		expect(lines[0]).toContain("Subagent");
-		for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(14);
+		expect(expanded.render(40)).toEqual([
+			"╭─ Subagent update",
+			"│ worker id stopped",
+			"│ one",
+			"│ two",
+			"│ three",
+			"│ four",
+			"│ five",
+			"│ six",
+			"╰─",
+		]);
+		const narrow = expanded.render(14);
+		expect(narrow[0]).toContain("Subagent");
+		for (const line of narrow) expect(visibleWidth(line)).toBeLessThanOrEqual(14);
 	});
 });
