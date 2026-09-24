@@ -1,4 +1,14 @@
-import type { AgentSession, ExtensionAPI, ExtensionContext, ModelRuntime, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+	AgentBeforeSettleEvent,
+	AgentSession,
+	AgentSessionEvent,
+	ExtensionAPI,
+	ExtensionContext,
+	ModelRuntime,
+	SessionBoundaryDraft,
+	SessionManager,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { describe, expect, test, vi } from "vitest";
 import {
 	DEFAULT_SUBAGENT_MAX_CONCURRENCY,
@@ -35,6 +45,8 @@ interface Internals {
 	resolveModel(requested: string | undefined, fallback: unknown): Promise<unknown>;
 	openRuntime(record: TestRecord, model?: unknown): Promise<void>;
 	cloneSourceManager(record: TestRecord, cwd: string): SessionManager;
+	handleChildEvent(record: TestRecord, event: AgentSessionEvent): void;
+	validateTools(requested: string[], inherited?: string[]): string[];
 	persistRegistry(): void;
 }
 
@@ -139,9 +151,12 @@ function installCreateHarness(internals: Internals, finalText = "final handoff")
 		resolvePrompt = resolve;
 	});
 	const messages: any[] = [];
+	let onMessage = (_message: any) => {};
 	const prompt = vi.fn(async () => {
 		await promptGate;
-		messages.push(assistant(finalText));
+		const message = assistant(finalText);
+		messages.push(message);
+		onMessage(message);
 	});
 	const session = {
 		messages,
@@ -149,14 +164,13 @@ function installCreateHarness(internals: Internals, finalText = "final handoff")
 		dispose: vi.fn(),
 		getSessionStats: () => undefined,
 		clearQueue: vi.fn(),
-		abortRetry: vi.fn(),
-		abortCompaction: vi.fn(),
-		agent: { abort: vi.fn(() => resolvePrompt()) },
+		abort: vi.fn(async () => resolvePrompt()),
 	} as unknown as AgentSession;
 	vi.spyOn(internals, "resolveCwd").mockResolvedValue(process.cwd());
 	vi.spyOn(internals, "resolveModel").mockResolvedValue({ provider: "test", id: "model" });
 	vi.spyOn(internals, "openRuntime").mockImplementation(async (record) => {
 		record.session = session;
+		onMessage = (message) => internals.handleChildEvent(record, { type: "message_end", message });
 	});
 	vi.spyOn(internals, "persistRegistry").mockImplementation(() => {});
 	return { session, prompt, resolvePrompt };
@@ -218,6 +232,41 @@ describe("scoped tool protocol", () => {
 		});
 		expect(prompt).toContain("one concise final response");
 		expect(prompt).toContain("end with a direct question");
+	});
+});
+
+describe("settlement reminders", () => {
+	test("preserves earlier boundary drafts and reminds each running cohort once", () => {
+		const { supervisor, internals, sent } = createSupervisor();
+		addRecord(internals, metadata({ state: "running" }));
+		const earlier: SessionBoundaryDraft = { type: "custom", customType: "earlier", data: {} };
+		const event = { outcome: "completed", entries: [earlier] } as AgentBeforeSettleEvent;
+		const result = supervisor.remindRunningDescendants(event);
+		expect(result?.continue).toBe(true);
+		expect(result?.entries?.[0]).toBe(earlier);
+		expect(result?.entries?.[1]).toMatchObject({
+			type: "custom_message",
+			content: expect.stringContaining("worker (child-1)"),
+		});
+		expect(supervisor.remindRunningDescendants(event)).toBeUndefined();
+		expect(sent).toEqual([]);
+	});
+
+	test.each(["aborted", "error"] as const)("does not restart an %s run or consume its reminder", (outcome) => {
+		const { supervisor, internals } = createSupervisor();
+		addRecord(internals, metadata({ state: "running" }));
+		const event = { outcome, entries: [] } as unknown as AgentBeforeSettleEvent;
+		expect(supervisor.remindRunningDescendants(event)).toBeUndefined();
+		expect(supervisor.remindRunningDescendants({ ...event, outcome: "completed" })?.continue).toBe(true);
+	});
+});
+
+describe("built-in tools", () => {
+	test("accepts explicit PowerShell access without allowing descendant escalation", () => {
+		const { internals } = createSupervisor();
+		expect(internals.validateTools(["powershell"])).toEqual(["powershell"]);
+		expect(internals.validateTools(["powershell"], ["read", "powershell"])).toEqual(["powershell"]);
+		expect(() => internals.validateTools(["powershell"], ["read"])).toThrow("exceed parent privileges");
 	});
 });
 
@@ -374,15 +423,13 @@ describe("stop", () => {
 		record.runPromise = new Promise<void>((resolve) => {
 			resolveRun = resolve;
 		});
-		const abort = vi.fn(() => {
+		const abort = vi.fn(async () => {
 			record.metadata.state = "stopped";
 			resolveRun();
 		});
 		record.session = {
 			clearQueue: vi.fn(),
-			abortRetry: vi.fn(),
-			abortCompaction: vi.fn(),
-			agent: { abort },
+			abort,
 		} as unknown as AgentSession;
 		return abort;
 	}

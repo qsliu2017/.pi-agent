@@ -263,7 +263,7 @@ export default function SubagentExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, context) => registerCreateTool(context as ModelDiscoveryContext));
 	pi.on("model_select", (event, context) => registerCreateTool(context as ModelDiscoveryContext, event.model));
-	pi.on("agent_settled", () => supervisor?.remindRunningDescendants());
+	pi.on("agent_before_settle", (event) => supervisor?.remindRunningDescendants(event));
 	pi.on("session_start", async (_event, context) => {
 		supervisor = await SubagentSupervisor.create(pi, context);
 		installDashboard(context, supervisor);

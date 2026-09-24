@@ -5,16 +5,17 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AgentMessage, AgentToolUpdateCallback, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, type Api, type AssistantMessage, type Model, type Provider } from "@earendil-works/pi-ai";
 import {
+	type AgentBeforeSettleEvent,
+	type AgentBeforeSettleEventResult,
 	type AgentSession,
 	type AgentSessionEvent,
 	createAgentSession,
-	createExtensionRuntime,
+	DefaultResourceLoader,
 	defineTool,
 	type ExtensionAPI,
 	type ExtensionContext,
 	getAgentDir,
 	ModelRuntime,
-	type ResourceLoader,
 	SessionManager,
 	SettingsManager,
 	type ToolDefinition,
@@ -56,7 +57,7 @@ import {
 export const DEFAULT_SUBAGENT_MAX_DEPTH = 3;
 export const DEFAULT_SUBAGENT_MAX_CONCURRENCY = 4;
 const DEFAULT_TOOLS = ["read", "grep", "find", "ls"] as const;
-const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+const BUILTIN_TOOLS = new Set(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]);
 const MANAGEMENT_TOOL_NAMES = ["subagent_list", "subagent_wait", "subagent_stop"];
 const MAX_PREVIEW_CHARS = 4_000;
 const MAX_RETAINED_TURNS = 5;
@@ -91,7 +92,7 @@ interface ChildRecord {
 	unsubscribe?: () => void;
 	lock: Mutex;
 	runPromise?: Promise<void>;
-	runMessageStart?: number;
+	lastAssistant?: AssistantMessage;
 	abortCause?: AbortCause;
 	claimed: boolean;
 	activeStartedAt?: number;
@@ -195,17 +196,11 @@ function textFromUnknown(value: unknown): string | undefined {
 function toolPreview(name: string, args: unknown): string | undefined {
 	if (!args || typeof args !== "object") return undefined;
 	const values = args as Record<string, unknown>;
-	if (name === "bash" && typeof values.command === "string") return truncatePreview(values.command);
+	if ((name === "bash" || name === "powershell") && typeof values.command === "string") {
+		return truncatePreview(values.command);
+	}
 	if (typeof values.path === "string") return values.path;
 	return textFromUnknown(args);
-}
-
-function lastAssistant(messages: AgentMessage[]): AssistantMessage | undefined {
-	for (let index = messages.length - 1; index >= 0; index--) {
-		const message = messages[index];
-		if (message?.role === "assistant") return message;
-	}
-	return undefined;
 }
 
 function rebuildTurns(messages: AgentMessage[]): TurnView[] {
@@ -244,23 +239,6 @@ function rebuildTurns(messages: AgentMessage[]): TurnView[] {
 		}
 	}
 	return turns;
-}
-
-function exactResourceLoader(systemPrompt: string): ResourceLoader {
-	const extensions = { extensions: [], errors: [], runtime: createExtensionRuntime() };
-	return {
-		getExtensions: () => extensions,
-		getSkills: () => ({ skills: [], diagnostics: [] }),
-		getPrompts: () => ({ prompts: [], diagnostics: [] }),
-		getThemes: () => ({ themes: [], diagnostics: [] }),
-		getAgentsFiles: () => ({ agentsFiles: [] }),
-		getSystemPrompt: () => systemPrompt,
-		getSystemPromptSource: () => undefined,
-		getAppendSystemPrompt: () => [],
-		getAppendSystemPromptSources: () => [],
-		extendResources: () => {},
-		reload: async () => {},
-	};
 }
 
 function isPersistedRegistry(value: unknown): value is PersistedRegistry {
@@ -434,14 +412,26 @@ export class SubagentSupervisor {
 		}));
 	}
 
-	remindRunningDescendants(): void {
-		if (!this.accepting || this.disposed) return;
-		const content = this.runningReminder(ROOT_CALLER_ID);
+	remindRunningDescendants(
+		event: AgentBeforeSettleEvent,
+		callerId = ROOT_CALLER_ID,
+	): AgentBeforeSettleEventResult | undefined {
+		if (event.outcome !== "completed" || !this.accepting || this.disposed) return;
+		const content = this.runningReminder(callerId);
 		if (!content) return;
-		this.pi.sendMessage(
-			{ customType: NOTIFICATION_MESSAGE_TYPE, content, display: true, details: { source: "subagent-reminder" } },
-			{ deliverAs: "followUp", triggerTurn: true },
-		);
+		return {
+			entries: [
+				...event.entries,
+				{
+					type: "custom_message",
+					customType: NOTIFICATION_MESSAGE_TYPE,
+					content,
+					display: true,
+					details: { source: "subagent-reminder" },
+				},
+			],
+			continue: true,
+		};
 	}
 
 	async createSubagent(
@@ -671,7 +661,7 @@ export class SubagentSupervisor {
 					child === target
 						? params.reason
 						: `Stopped with ancestor ${target.metadata.name} (${target.metadata.id})${params.reason ? `: ${params.reason}` : ""}`;
-				this.cancelRun(child, "requested");
+				void this.cancelRun(child, "requested");
 			}
 			this.persistRegistry();
 			return { record: target, active: running };
@@ -722,7 +712,7 @@ export class SubagentSupervisor {
 			if (record.metadata.state === "running") {
 				record.claimed = false;
 				record.metadata.notifyOnStop = true;
-				this.cancelRun(record, "shutdown");
+				void this.cancelRun(record, "shutdown");
 				if (record.runPromise) runs.push(record.runPromise);
 			}
 		}
@@ -795,17 +785,36 @@ export class SubagentSupervisor {
 			record.manager ?? SessionManager.open(record.metadata.sessionPath, this.childSessionDir, record.metadata.cwd);
 		if (record.metadata.childLeafId === null) manager.resetLeaf();
 		else if (manager.getEntry(record.metadata.childLeafId)) manager.branch(record.metadata.childLeafId);
+		const settingsManager = SettingsManager.inMemory();
+		const resourceLoader = new DefaultResourceLoader({
+			cwd: record.metadata.cwd,
+			agentDir: this.agentDir,
+			settingsManager,
+			noExtensions: true,
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+			noContextFiles: true,
+			systemPrompt: record.metadata.generatedSystemPrompt,
+			appendSystemPrompt: [],
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_before_settle", (event) => this.remindRunningDescendants(event, record.metadata.id));
+				},
+			],
+		});
+		await resourceLoader.reload();
 		const { session } = await createAgentSession({
 			cwd: record.metadata.cwd,
 			agentDir: this.agentDir,
 			modelRuntime: this.modelRuntime,
 			model: resolvedModel,
 			thinkingLevel: record.metadata.thinkingLevel,
-			resourceLoader: exactResourceLoader(record.metadata.generatedSystemPrompt),
+			resourceLoader,
 			customTools: this.privateTools(record.metadata.id, record.metadata.remainingDepth),
 			tools: record.metadata.enabledTools,
 			sessionManager: manager,
-			settingsManager: SettingsManager.inMemory(),
+			settingsManager,
 		});
 		record.manager = manager;
 		record.session = session;
@@ -891,7 +900,7 @@ ${input.rolePrompt?.trim() || "Act as a focused implementation and research work
 		if (!record.session) throw new Error(`Subagent runtime unavailable: ${record.metadata.name}`);
 		if (record.runPromise) throw new Error(`Subagent ${record.metadata.name} already has an active run`);
 		record.metadata.state = "running";
-		record.runMessageStart = record.session.messages.length;
+		record.lastAssistant = undefined;
 		record.metadata.updatedAt = Date.now();
 		record.metadata.lastActivityAt = Date.now();
 		record.activeStartedAt = Date.now();
@@ -900,7 +909,7 @@ ${input.rolePrompt?.trim() || "Act as a focused implementation and research work
 				() => {
 					if (record.metadata.state !== "running") return;
 					record.metadata.error = `Execution limit exceeded (${record.metadata.limits.timeoutSeconds}s)`;
-					this.cancelRun(record, "timeout");
+					void this.cancelRun(record, "timeout");
 				},
 				record.metadata.limits.timeoutSeconds * 1_000,
 			);
@@ -929,8 +938,7 @@ ${input.rolePrompt?.trim() || "Act as a focused implementation and research work
 			record.metadata.activeMs += Date.now() - record.activeStartedAt;
 			record.activeStartedAt = undefined;
 		}
-		const newMessages = record.session?.messages.slice(record.runMessageStart ?? 0) ?? [];
-		const assistant = lastAssistant(newMessages);
+		const assistant = record.lastAssistant;
 		const finalResponse = assistantText(assistant);
 		const cause = record.abortCause;
 		let reason: StopReason = "finished";
@@ -955,7 +963,7 @@ ${input.rolePrompt?.trim() || "Act as a focused implementation and research work
 		record.currentActivity = undefined;
 		record.activeActivities.clear();
 		record.abortCause = undefined;
-		record.runMessageStart = undefined;
+		record.lastAssistant = undefined;
 		record.runPromise = undefined;
 		this.captureRuntimeMetadata(record);
 		const claimedByWaiter = this.evaluateWaiters(record);
@@ -966,15 +974,13 @@ ${input.rolePrompt?.trim() || "Act as a focused implementation and research work
 		if (record.metadata.notifyOnStop && this.accepting) this.notifyOwner(record);
 	}
 
-	private cancelRun(record: ChildRecord, cause: AbortCause): void {
+	private async cancelRun(record: ChildRecord, cause: AbortCause): Promise<void> {
 		record.abortCause = cause;
 		if (record.timeout) clearTimeout(record.timeout);
 		record.timeout = undefined;
 		try {
 			record.session?.clearQueue();
-			record.session?.abortRetry();
-			record.session?.abortCompaction();
-			record.session?.agent.abort();
+			await record.session?.abort();
 		} catch (error) {
 			record.metadata.error = `${record.metadata.error ? `${record.metadata.error}; ` : ""}Abort failed: ${
 				error instanceof Error ? error.message : String(error)
@@ -1186,7 +1192,9 @@ ${input.rolePrompt?.trim() || "Act as a focused implementation and research work
 
 	private handleChildEvent(record: ChildRecord, event: AgentSessionEvent): void {
 		if (this.disposed) return;
-		if (event.type === "message_end") this.checkpointChildLeaf(record);
+		if (event.type === "message_end" || event.type === "entry_appended" || (event.type === "compaction_end" && event.result)) {
+			this.checkpointChildLeaf(record);
+		}
 		const now = Date.now();
 		record.metadata.lastActivityAt = now;
 		switch (event.type) {
@@ -1254,16 +1262,12 @@ ${input.rolePrompt?.trim() || "Act as a focused implementation and research work
 				break;
 			case "message_end":
 				if (event.message.role === "assistant") {
+					record.lastAssistant = event.message;
 					const previews = assistantPreviews(event.message);
 					const turn = record.turns.at(-1);
 					if (turn) turn.textPreview = previews.text ?? turn.textPreview;
 				}
 				break;
-			case "agent_settled": {
-				const content = this.runningReminder(record.metadata.id);
-				if (content && record.session) queueMicrotask(() => void record.session?.followUp(content).catch(() => {}));
-				break;
-			}
 			default:
 				break;
 		}

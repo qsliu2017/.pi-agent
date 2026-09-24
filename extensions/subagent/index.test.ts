@@ -1,14 +1,20 @@
+import { stripVTControlCharacters } from "node:util";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, MessageRenderer, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import {
+	type ExtensionAPI,
+	type ExtensionContext,
+	initTheme,
+	type MessageRenderer,
+	type Theme,
+	ToolExecutionComponent,
+	type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import type { TUI } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
 import subagentExtension, { buildSubagentCreateDescription } from "./index.ts";
 import { SubagentCreateParams, SubagentListParams, SubagentWaitParams } from "./schemas.ts";
+import { SubagentSupervisor } from "./supervisor.ts";
 import { NOTIFICATION_MESSAGE_TYPE } from "./types.ts";
-
-vi.mock("@earendil-works/pi-ai", () => ({
-	StringEnum: (values: readonly string[], options?: object) => Type.String({ enum: [...values], ...options }),
-}));
 
 vi.mock("./supervisor.ts", () => ({
 	DEFAULT_SUBAGENT_MAX_CONCURRENCY: 4,
@@ -103,8 +109,21 @@ describe("tool surface", () => {
 		const result = capture();
 		expect(result.flags.get("subagent-max-depth")).toMatchObject({ default: "3" });
 		expect(result.flags.get("subagent-max-concurrency")).toMatchObject({ default: "4" });
-		expect(result.handlers.get("agent_settled")).toHaveLength(1);
+		expect(result.handlers.get("agent_before_settle")).toHaveLength(1);
+		expect(result.handlers.has("agent_settled")).toBe(false);
 	});
+});
+
+test("forwards the actionable settlement boundary after session initialization", async () => {
+	const result = capture();
+	const event = { type: "agent_before_settle", outcome: "completed", entries: [] };
+	const boundaryResult = { entries: [], continue: true };
+	const remindRunningDescendants = vi.fn(() => boundaryResult);
+	vi.mocked(SubagentSupervisor.create).mockResolvedValue({ remindRunningDescendants } as unknown as SubagentSupervisor);
+	const context = { mode: "json", cwd: "/repo", model: model(), scopedModels: [] } as unknown as ExtensionContext;
+	for (const handler of result.handlers.get("session_start") ?? []) await handler({ reason: "startup" }, context);
+	expect(result.handlers.get("agent_before_settle")?.[0]?.(event, context)).toBe(boundaryResult);
+	expect(remindRunningDescendants).toHaveBeenCalledWith(event);
 });
 
 describe("descriptions and rendering", () => {
@@ -181,6 +200,44 @@ describe("descriptions and rendering", () => {
 			{} as never,
 		);
 		expect(component.render(100)).toEqual(["subagent_wait any"]);
+	});
+
+	test.each(["wait", "background"] as const)("preserves %s create transcript layout in Pi's tool component", async (mode) => {
+		initTheme("dark", false);
+		const create = registerCreate(capture());
+		const component = new ToolExecutionComponent(
+			create.name,
+			"call-id",
+			{ task: "original task", mode },
+			{ showImages: false },
+			create,
+			{ requestRender: vi.fn() } as unknown as TUI,
+			"/repo",
+		);
+		component.updateResult({
+			content: [{ type: "text", text: "handoff one\ntwo\nthree\nfour\nfive\nhandoff six" }],
+			isError: false,
+			details: {
+				action: "create", mode, childId: "child-id", acceptedAt: 1,
+				snapshot: {
+					id: "child-id", name: "worker", state: "stopped", model: "openai/gpt-test",
+					thinking_level: "off", cwd: "/repo", stop_reason: "finished",
+					final_response: "handoff one\ntwo\nthree\nfour\nfive\nhandoff six",
+				},
+			},
+		});
+		await Promise.resolve();
+		const collapsed = component.render(100).map(stripVTControlCharacters).join("\n");
+		expect(collapsed).toContain("original task");
+		expect(collapsed).toContain("child-id stopped");
+		expect(collapsed).not.toContain("handoff six");
+		if (mode === "wait") expect(collapsed.indexOf("handoff one")).toBeGreaterThan(collapsed.indexOf("original task"));
+		else expect(collapsed).not.toContain("handoff one");
+		component.setExpanded(true);
+		const expanded = component.render(100).map(stripVTControlCharacters).join("\n");
+		expect(expanded).toContain("original task");
+		if (mode === "wait") expect(expanded).toContain("handoff six");
+		else expect(expanded).not.toContain("handoff one");
 	});
 
 	test("registers the expandable notification renderer", () => {
