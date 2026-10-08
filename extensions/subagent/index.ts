@@ -122,6 +122,7 @@ export default function SubagentExtension(pi: ExtensionAPI): void {
 				"Use background mode only when the parent must continue before that child stops; then join it with subagent_wait.",
 			],
 			parameters: SubagentCreateParams,
+			exposure: "model-only",
 			executionMode: "parallel",
 			execute: async (_id, params, signal, onUpdate) =>
 				requireSupervisor().createSubagent(ROOT_CALLER_ID, params, signal, onUpdate),
@@ -177,6 +178,7 @@ export default function SubagentExtension(pi: ExtensionAPI): void {
 		description: "List event-derived snapshots of running or stopped subagents without invoking another model.",
 		promptSnippet: "Inspect subagent state, lineage, activity, handoff, and errors",
 		parameters: SubagentListParams,
+		exposure: "model-only",
 		execute: async (_id, params) => requireSupervisor().listSubagents(ROOT_CALLER_ID, params),
 		renderCall(args, theme, renderContext) {
 			return renderSubagentListCall(
@@ -202,6 +204,7 @@ export default function SubagentExtension(pi: ExtensionAPI): void {
 		description: "Wait for any or all selected background subagents to stop. A timeout releases only the parent wait.",
 		promptSnippet: "Join any or all background subagents",
 		parameters: SubagentWaitParams,
+		exposure: "model-only",
 		execute: async (_id, params, signal, onUpdate) =>
 			requireSupervisor().waitSubagents(ROOT_CALLER_ID, params, signal, onUpdate),
 		renderCall(args, theme, renderContext) {
@@ -236,6 +239,7 @@ export default function SubagentExtension(pi: ExtensionAPI): void {
 		description: "Recursively abort an active subagent and its active descendants while retaining durable history.",
 		promptSnippet: "Recursively stop active work while retaining history",
 		parameters: SubagentStopParams,
+		exposure: "model-only",
 		execute: async (_id, params, signal, onUpdate) =>
 			requireSupervisor().stopSubagent(ROOT_CALLER_ID, params, signal, onUpdate),
 		renderCall(args, theme, renderContext) {

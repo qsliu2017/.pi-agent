@@ -41,6 +41,7 @@ interface Internals {
 	privateTools(callerId: string, remainingDepth: number): ToolDefinition[];
 	generateSystemPrompt(input: any): string;
 	evaluateWaiters(record: TestRecord): boolean;
+	notifyOwner(record: TestRecord): void;
 	resolveCwd(input: string | undefined, base: string, contained: boolean): Promise<string>;
 	resolveModel(requested: string | undefined, fallback: unknown): Promise<unknown>;
 	openRuntime(record: TestRecord, model?: unknown): Promise<void>;
@@ -261,7 +262,32 @@ describe("settlement reminders", () => {
 	});
 });
 
+describe("owner notifications", () => {
+	test.each(["queued", "handled"] as const)("acknowledges a %s follow-up without duplicating it at the root", async (disposition) => {
+		const { supervisor, internals, sent } = createSupervisor();
+		const owner = addRecord(internals, metadata({ id: "owner", state: "running" }));
+		const followUp = vi.fn().mockResolvedValue(disposition);
+		owner.session = { followUp } as unknown as AgentSession;
+		const child = addRecord(internals, metadata({
+			id: "nested", parentId: "owner", finalResponse: "handoff", notifyOnStop: true,
+		}));
+		internals.notifyOwner(child);
+		await Promise.resolve();
+		expect(followUp).toHaveBeenCalledWith(expect.stringContaining("handoff"));
+		expect(child.metadata.notifyOnStop).toBe(false);
+		expect(sent).toEqual([]);
+		// Avoid treating the deliberately minimal session stub as a live run during cleanup.
+		owner.metadata.state = "stopped";
+		await supervisor.shutdown();
+	});
+});
+
 describe("built-in tools", () => {
+	test.each(["*", "+write", "-read", "mcp__*", "codemode", "tool_search"])("rejects SDK tool-selection syntax or unapproved tools: %s", (tool) => {
+		const { internals } = createSupervisor();
+		expect(() => internals.validateTools([tool])).toThrow("Unsupported child tools");
+	});
+
 	test("accepts explicit PowerShell access without allowing descendant escalation", () => {
 		const { internals } = createSupervisor();
 		expect(internals.validateTools(["powershell"])).toEqual(["powershell"]);

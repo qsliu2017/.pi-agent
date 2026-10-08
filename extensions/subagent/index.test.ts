@@ -75,6 +75,12 @@ describe("tool surface", () => {
 		]);
 	});
 
+	test("keeps orchestration tools model-only so codemode cannot hide or nest them", () => {
+		const result = capture();
+		registerCreate(result);
+		for (const tool of result.tools) expect(tool.exposure).toBe("model-only");
+	});
+
 	test("defines the redesigned schemas", () => {
 		const create = JSON.parse(JSON.stringify(SubagentCreateParams));
 		expect(Object.keys(create.properties)).toEqual([

@@ -115,6 +115,49 @@ describe("Pi SDK lifecycle", () => {
 		expect(faux.state.callCount).toBe(5);
 	});
 
+	test("queues a descendant handoff through the SDK followUp disposition API", async () => {
+		const { supervisor, internals, faux } = await setup();
+		let finishDescendant = () => {};
+		let finishOwner = () => {};
+		const descendantGate = new Promise<void>((resolve) => { finishDescendant = resolve; });
+		const ownerGate = new Promise<void>((resolve) => { finishOwner = resolve; });
+		cleanups.push(async () => { finishDescendant(); finishOwner(); });
+		const respond: FauxResponseFactory = async (context) => {
+			if (getCurrentSystemPrompt(context.messages).includes("subagent nested (")) {
+				await descendantGate;
+				return fauxAssistantMessage("nested notification");
+			}
+			const last = context.messages.at(-1)!;
+			if (last.role === "toolResult") {
+				await ownerGate;
+				return fauxAssistantMessage("interim answer");
+			}
+			if (contentText(last.content).includes("nested notification")) {
+				return fauxAssistantMessage("received handoff");
+			}
+			return fauxAssistantMessage(fauxToolCall("subagent_create", {
+				task: "research", name: "nested", mode: "background",
+			}));
+		};
+		faux.setResponses(Array.from({ length: 4 }, () => respond));
+		const accepted = await supervisor.createSubagent(ROOT_CALLER_ID, {
+			task: "delegate", name: "owner", mode: "background",
+		});
+		const owner = internals.children.get(accepted.details.childId)!;
+		const run = owner.runPromise;
+		await vi.waitFor(() => expect(faux.state.callCount).toBe(3));
+		const followUp = vi.spyOn(owner.session!, "followUp");
+		finishDescendant();
+		await vi.waitFor(() => expect(followUp).toHaveBeenCalledTimes(1));
+		await expect(followUp.mock.results[0]!.value).resolves.toBe("queued");
+		expect([...internals.children.values()].find((record) => record.metadata.name === "nested")!
+			.metadata.notifyOnStop).toBe(false);
+		finishOwner();
+		await run;
+		expect(owner.metadata.finalResponse).toBe("received handoff");
+		expect(faux.state.callCount).toBe(4);
+	});
+
 	test("session cancellation prevents automatic recovery after agent_end", async () => {
 		const { supervisor, internals, faux } = await setup();
 		let finishResponse = () => {};
@@ -146,8 +189,17 @@ describe("Pi SDK lifecycle", () => {
 
 	test("enforces run timeouts in an isolated SDK session", async () => {
 		const { supervisor, internals, faux, cwd } = await setup();
-		await mkdir(join(cwd, "extensions"));
-		await writeFile(join(cwd, "extensions", "unrelated.ts"), 'throw new Error("unrelated extension loaded");');
+		for (const base of [cwd, join(cwd, ".pi")]) {
+			await mkdir(join(base, "extensions"), { recursive: true });
+			await writeFile(join(base, "extensions", "unrelated.ts"), 'throw new Error("unrelated extension loaded");');
+			await writeFile(join(base, "settings.json"), JSON.stringify({
+				defaultTools: ["+codemode", "+tool_search", "+bash", "+write"],
+				extensions: ["builtin:mcp", "builtin:codemode", "builtin:tool-search"],
+			}));
+			await writeFile(join(base, "mcp.json"), JSON.stringify({
+				mcpServers: { unrelated: { command: "must-not-launch-subagent-mcp" } },
+			}));
+		}
 		await writeFile(join(cwd, "AGENTS.md"), "Unrelated project context");
 		await writeFile(join(cwd, "APPEND_SYSTEM.md"), "Unrelated appended prompt");
 		faux.setResponses([async (_context, options) => {
@@ -159,8 +211,12 @@ describe("Pi SDK lifecycle", () => {
 			expect(resources.getPrompts().prompts).toEqual([]);
 			expect(resources.getAgentsFiles().agentsFiles).toEqual([]);
 			expect(resources.getAppendSystemPrompt()).toEqual([]);
-			expect(record.session!.getActiveToolNames()).not.toContain("bash");
-			expect(record.session!.getActiveToolNames()).not.toContain("powershell");
+			expect(record.session!.getActiveToolNames()).toEqual([
+				"read", "grep", "find", "ls", "subagent_list", "subagent_wait", "subagent_stop", "subagent_create",
+			]);
+			expect(record.session!.getAllTools().some((tool) =>
+				tool.name === "codemode" || tool.name === "tool_search" || tool.name.startsWith("mcp__"),
+			)).toBe(false);
 			const signal = options!.signal!;
 			await new Promise<void>((resolve) => {
 				if (signal.aborted) resolve();
